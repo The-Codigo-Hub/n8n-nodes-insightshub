@@ -93,7 +93,7 @@ class InsightshubWorkflowReport {
                     displayOptions: { show: { payloadMode: ['native'] } },
                     required: true,
                     default: '',
-                    description: 'n8n API key with permission to read executions (Settings → API)',
+                    description: 'N8n API key with permission to read executions (Settings → API)',
                 },
                 {
                     displayName: 'Project Name',

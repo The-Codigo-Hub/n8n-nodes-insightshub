@@ -57,7 +57,6 @@ class InsightshubWorkflowReport {
                     displayName: 'Project ID',
                     name: 'projectId',
                     type: 'string',
-                    displayOptions: { show: { payloadMode: ['structured'] } },
                     required: true,
                     default: '',
                     placeholder: 'my-n8n-project',
@@ -67,7 +66,6 @@ class InsightshubWorkflowReport {
                     displayName: 'Environment',
                     name: 'environment',
                     type: 'options',
-                    displayOptions: { show: { payloadMode: ['structured'] } },
                     options: [
                         { name: 'Development', value: 'dev' },
                         { name: 'Production', value: 'prod' },
@@ -78,10 +76,30 @@ class InsightshubWorkflowReport {
                     description: 'Deployment environment for this workflow execution',
                 },
                 {
+                    displayName: 'N8n Base URL',
+                    name: 'n8nBaseUrl',
+                    type: 'string',
+                    displayOptions: { show: { payloadMode: ['native'] } },
+                    required: true,
+                    default: 'http://localhost:5678',
+                    placeholder: 'http://localhost:5678',
+                    description: 'Base URL of your n8n instance (used to call /api/v1/executions)',
+                },
+                {
+                    displayName: 'N8n API Key',
+                    name: 'n8nApiKey',
+                    type: 'string',
+                    typeOptions: { password: true },
+                    displayOptions: { show: { payloadMode: ['native'] } },
+                    required: true,
+                    default: '',
+                    description: 'n8n API key with permission to read executions (Settings → API)',
+                },
+                {
                     displayName: 'Project Name',
                     name: 'projectName',
                     type: 'string',
-                    displayOptions: { show: { payloadMode: ['structured'] } },
+                    displayOptions: { show: { payloadMode: ['structured', 'native'] } },
                     default: '',
                     placeholder: 'My n8n Project',
                     description: 'Human-readable project name (optional)',
@@ -239,8 +257,38 @@ class InsightshubWorkflowReport {
         const baseUrl = credentials.baseUrl.replace(/\/+$/, '');
         let body;
         if (payloadMode === 'native') {
-            const executions = items.map((item) => item.json);
-            body = executions.length === 1 ? executions[0] : executions;
+            const projectId = this.getNodeParameter('projectId', 0, '');
+            if (!projectId) {
+                throw new n8n_workflow_1.NodeOperationError(this.getNode(), 'Project ID is required');
+            }
+            const environment = this.getNodeParameter('environment', 0, 'prod');
+            const projectName = this.getNodeParameter('projectName', 0, '');
+            const n8nBaseUrl = this.getNodeParameter('n8nBaseUrl', 0, '').replace(/\/+$/, '');
+            const n8nApiKey = this.getNodeParameter('n8nApiKey', 0, '');
+            if (!n8nBaseUrl || !n8nApiKey) {
+                throw new n8n_workflow_1.NodeOperationError(this.getNode(), 'N8n Base URL and API Key are required for Native mode');
+            }
+            const executionId = this.getExecutionId();
+            let executionData;
+            try {
+                executionData = await this.helpers.httpRequest({
+                    method: 'GET',
+                    url: `${n8nBaseUrl}/api/v1/executions/${executionId}?includeData=true`,
+                    headers: { 'X-N8N-API-KEY': n8nApiKey },
+                    json: true,
+                });
+            }
+            catch (error) {
+                throw new n8n_workflow_1.NodeApiError(this.getNode(), error, {
+                    message: `Failed to fetch execution ${executionId} from n8n API`,
+                });
+            }
+            body = {
+                projectId,
+                ...(projectName ? { projectName } : {}),
+                environment,
+                workflow: executionData,
+            };
         }
         else {
             const projectId = this.getNodeParameter('projectId', 0, '');

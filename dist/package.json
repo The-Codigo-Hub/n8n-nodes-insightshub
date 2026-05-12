@@ -28,7 +28,6 @@
         "strict": true,
         "credentials": ["dist/credentials/InsightshubApi.credentials.js"],
         "nodes": [
-            "dist/nodes/Insightshub/Insightshub.node.js",
             "dist/nodes/InsightshubWorkflowReport/InsightshubWorkflowReport.node.js"
         ]
     },

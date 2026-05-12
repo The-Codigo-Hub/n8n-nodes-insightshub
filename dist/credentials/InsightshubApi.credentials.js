@@ -9,12 +9,22 @@ class InsightshubApi {
         this.documentationUrl = 'https://github.com/The-Codigo-Hub/n8n-nodes-insightshub#credentials';
         this.properties = [
             {
-                displayName: 'API Key',
+                displayName: 'Base URL',
+                name: 'baseUrl',
+                type: 'string',
+                required: true,
+                default: '',
+                placeholder: 'https://api.example.com',
+                description: 'InsightHub API base URL. Set via the INSIGHTHUB_BASE_URL environment variable or enter it directly.',
+            },
+            {
+                displayName: 'Collector API Key',
                 name: 'apiKey',
                 type: 'string',
                 typeOptions: { password: true },
                 required: true,
                 default: '',
+                description: 'InsightHub collector token (INSIGHTHUB_COLLECTOR_TOKEN). Never share or log this value.',
             },
         ];
         this.authenticate = {
@@ -27,8 +37,9 @@ class InsightshubApi {
         };
         this.test = {
             request: {
-                baseURL: 'https://insights-backend.wolfielab.xyz/',
-                url: '/v1/user',
+                baseURL: '={{$credentials.baseUrl}}',
+                url: '/api/n8n/collector/check',
+                method: 'GET',
             },
         };
     }

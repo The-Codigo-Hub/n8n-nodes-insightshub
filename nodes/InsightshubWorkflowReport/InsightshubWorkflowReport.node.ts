@@ -110,7 +110,7 @@ export class InsightshubWorkflowReport implements INodeType {
 				displayOptions: { show: { payloadMode: ['native'] } },
 				required: true,
 				default: '',
-				description: 'n8n API key with permission to read executions (Settings → API)',
+				description: 'N8n API key with permission to read executions (Settings → API)',
 			},
 
 			// ── Structured mode: additional required fields ──────────────────────────
@@ -308,6 +308,8 @@ export class InsightshubWorkflowReport implements INodeType {
 
 			let executionData: IDataObject;
 			try {
+				// Reason: the n8n API key is a user-supplied node parameter, not a managed credential.
+				// eslint-disable-next-line @n8n/community-nodes/no-http-request-with-manual-auth
 				executionData = await this.helpers.httpRequest({
 					method: 'GET',
 					url: `${n8nBaseUrl}/api/v1/executions/${executionId}?includeData=true`,

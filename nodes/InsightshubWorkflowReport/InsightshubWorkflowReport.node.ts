@@ -418,8 +418,9 @@ export class InsightshubWorkflowReport implements INodeType {
 			};
 		}
 
+		let apiResponse: IDataObject;
 		try {
-			await this.helpers.httpRequestWithAuthentication.call(this, 'insightshubApi', {
+			apiResponse = await this.helpers.httpRequestWithAuthentication.call(this, 'insightshubApi', {
 				method: 'POST',
 				url: `${baseUrl}/api/n8n/executions/collect`,
 				headers: {
@@ -427,12 +428,16 @@ export class InsightshubWorkflowReport implements INodeType {
 				},
 				body,
 				json: true,
-			});
+			}) as IDataObject;
 		} catch (error) {
 			if (this.continueOnFail()) {
 				return [
 					items.map((item, index) => ({
-						json: { ...item.json, _reportError: (error as Error).message },
+						json: {
+							success: false,
+							error: (error as Error).message,
+							sentPayload: body,
+						},
 						pairedItem: { item: index },
 					})),
 				];
@@ -441,8 +446,13 @@ export class InsightshubWorkflowReport implements INodeType {
 			throw new NodeApiError(this.getNode(), error as JsonObject);
 		}
 
-		// Pass all input items through unchanged so the workflow can continue
-		return [items];
+		const outputJson: IDataObject = {
+			success: true,
+			...apiResponse,
+			sentPayload: body,
+		};
+
+		return [[{ json: outputJson, pairedItem: { item: 0 } }]];
 	}
 }
 

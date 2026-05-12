@@ -368,8 +368,9 @@ class InsightshubWorkflowReport {
                 metadata: { source: 'n8n', ...metadata },
             };
         }
+        let apiResponse;
         try {
-            await this.helpers.httpRequestWithAuthentication.call(this, 'insightshubApi', {
+            apiResponse = await this.helpers.httpRequestWithAuthentication.call(this, 'insightshubApi', {
                 method: 'POST',
                 url: `${baseUrl}/api/n8n/executions/collect`,
                 headers: {
@@ -383,14 +384,23 @@ class InsightshubWorkflowReport {
             if (this.continueOnFail()) {
                 return [
                     items.map((item, index) => ({
-                        json: { ...item.json, _reportError: error.message },
+                        json: {
+                            success: false,
+                            error: error.message,
+                            sentPayload: body,
+                        },
                         pairedItem: { item: index },
                     })),
                 ];
             }
             throw new n8n_workflow_1.NodeApiError(this.getNode(), error);
         }
-        return [items];
+        const outputJson = {
+            success: true,
+            ...apiResponse,
+            sentPayload: body,
+        };
+        return [[{ json: outputJson, pairedItem: { item: 0 } }]];
     }
 }
 exports.InsightshubWorkflowReport = InsightshubWorkflowReport;

@@ -482,29 +482,48 @@ export class InsightshubWorkflowReport implements INodeType {
 			// ── Conversation extraction ───────────────────────────────────────────────
 			const nativeConv = this.getNodeParameter('nativeConversation', 0, {}) as IDataObject;
 
+			// Helper: read a dot-path from a runData node's first output JSON
 			const getNestedValue = (obj: IDataObject, path: string): unknown =>
 				path.split('.').reduce((acc: unknown, key: string) =>
 					(acc && typeof acc === 'object' ? (acc as IDataObject)[key] : undefined), obj as unknown);
+
+			const getNodeJson = (
+				rd: Record<string, IDataObject[]> | undefined,
+				nodeName: string,
+			): IDataObject | undefined => {
+				if (!rd || !nodeName) return undefined;
+				const nodeExecs = rd[nodeName];
+				if (!Array.isArray(nodeExecs) || !nodeExecs.length) return undefined;
+				const nodeData = nodeExecs[0].data as IDataObject | undefined;
+				const main = nodeData?.main as unknown[][] | undefined;
+				const firstItem = main?.[0]?.[0] as IDataObject | undefined;
+				return firstItem?.json as IDataObject | undefined;
+			};
 
 			const getFromRunDataNode = (
 				rd: Record<string, IDataObject[]> | undefined,
 				nodeName: string,
 				dotPath: string,
 			): string | undefined => {
-				if (!rd || !nodeName || !dotPath) return undefined;
-				const nodeExecs = rd[nodeName];
-				if (!Array.isArray(nodeExecs) || !nodeExecs.length) return undefined;
-				const nodeData = nodeExecs[0].data as IDataObject | undefined;
-				const main = nodeData?.main as unknown[][] | undefined;
-				const firstItem = main?.[0]?.[0] as IDataObject | undefined;
-				const json = firstItem?.json as IDataObject | undefined;
+				const json = getNodeJson(rd, nodeName);
 				if (!json) return undefined;
 				const val = getNestedValue(json, dotPath);
-				return val !== undefined ? String(val) : undefined;
+				return val !== undefined && val !== null ? String(val) : undefined;
+			};
+
+			// Helper: pick first matching string field from a JSON object
+			const pickFirstString = (json: IDataObject, candidates: string[]): string | undefined => {
+				for (const key of candidates) {
+					const val = getNestedValue(json, key);
+					if (val && typeof val === 'string') return val;
+				}
+				return undefined;
 			};
 
 			let nativeConvPayload: IDataObject | undefined;
+
 			if (nativeConv.inputNode || nativeConv.outputNode || nativeConv.channel) {
+				// ── Manual config ──────────────────────────────────────────────────────
 				const convInput = getFromRunDataNode(runData, nativeConv.inputNode as string, nativeConv.inputPath as string);
 				const convOutput = getFromRunDataNode(runData, nativeConv.outputNode as string, nativeConv.outputPath as string);
 				const convCustomerId = getFromRunDataNode(runData, nativeConv.inputNode as string, nativeConv.customerIdPath as string);
@@ -514,6 +533,54 @@ export class InsightshubWorkflowReport implements INodeType {
 					...(convInput ? { input: convInput } : {}),
 					...(nativeConv.language ? { language: nativeConv.language } : {}),
 					...(convOutput ? { output: convOutput } : {}),
+				};
+				if (Object.keys(built).length) nativeConvPayload = built;
+			} else if (runData) {
+				// ── Auto-detect: no manual config provided ─────────────────────────────
+				const INPUT_CANDIDATES = ['Body', 'body.Body', 'message', 'body.message', 'text', 'body.text', 'query', 'body.query', 'input', 'body.input', 'content', 'body.content'];
+				const ID_CANDIDATES = ['From', 'body.From', 'from', 'body.from', 'userId', 'body.userId', 'sender', 'body.sender', 'phone', 'body.phone'];
+				const OUTPUT_CANDIDATES = ['text', 'output', 'response', 'message', 'answer', 'content', 'result', 'body'];
+
+				// Auto-input: from trigger node
+				let autoInput: string | undefined;
+				let autoCustomerId: string | undefined;
+				if (triggerName) {
+					const triggerJson = getNodeJson(runData, triggerName);
+					if (triggerJson) {
+						autoInput = pickFirstString(triggerJson, INPUT_CANDIDATES);
+						autoCustomerId = pickFirstString(triggerJson, ID_CANDIDATES);
+					}
+				}
+
+				// Auto-output: from the node with the highest executionIndex that has a main output
+				let maxExecIdx = -1;
+				let lastNodeName: string | undefined;
+				for (const [nodeName, execs] of Object.entries(runData)) {
+					if (!Array.isArray(execs)) continue;
+					for (const exec of execs) {
+						const idx = (exec.executionIndex as number) ?? -1;
+						if (idx > maxExecIdx) {
+							const nodeData = exec.data as IDataObject | undefined;
+							const main = nodeData?.main as unknown[][] | undefined;
+							const firstItem = main?.[0]?.[0] as IDataObject | undefined;
+							if (firstItem?.json && Object.keys(firstItem.json as object).length > 0) {
+								maxExecIdx = idx;
+								lastNodeName = nodeName;
+							}
+						}
+					}
+				}
+
+				let autoOutput: string | undefined;
+				if (lastNodeName) {
+					const lastJson = getNodeJson(runData, lastNodeName);
+					if (lastJson) autoOutput = pickFirstString(lastJson, OUTPUT_CANDIDATES);
+				}
+
+				const built: IDataObject = {
+					...(autoCustomerId ? { customerId: autoCustomerId } : {}),
+					...(autoInput ? { input: autoInput } : {}),
+					...(autoOutput ? { output: autoOutput } : {}),
 				};
 				if (Object.keys(built).length) nativeConvPayload = built;
 			}

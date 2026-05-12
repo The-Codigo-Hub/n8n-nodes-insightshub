@@ -318,7 +318,7 @@ class InsightshubWorkflowReport {
         };
     }
     async execute() {
-        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
+        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m;
         const items = this.getInputData();
         const payloadMode = this.getNodeParameter('payloadMode', 0, 'structured');
         const credentials = await this.getCredentials('insightshubApi');
@@ -432,9 +432,9 @@ class InsightshubWorkflowReport {
             }
             const nativeConv = this.getNodeParameter('nativeConversation', 0, {});
             const getNestedValue = (obj, path) => path.split('.').reduce((acc, key) => (acc && typeof acc === 'object' ? acc[key] : undefined), obj);
-            const getFromRunDataNode = (rd, nodeName, dotPath) => {
+            const getNodeJson = (rd, nodeName) => {
                 var _a;
-                if (!rd || !nodeName || !dotPath)
+                if (!rd || !nodeName)
                     return undefined;
                 const nodeExecs = rd[nodeName];
                 if (!Array.isArray(nodeExecs) || !nodeExecs.length)
@@ -442,11 +442,22 @@ class InsightshubWorkflowReport {
                 const nodeData = nodeExecs[0].data;
                 const main = nodeData === null || nodeData === void 0 ? void 0 : nodeData.main;
                 const firstItem = (_a = main === null || main === void 0 ? void 0 : main[0]) === null || _a === void 0 ? void 0 : _a[0];
-                const json = firstItem === null || firstItem === void 0 ? void 0 : firstItem.json;
+                return firstItem === null || firstItem === void 0 ? void 0 : firstItem.json;
+            };
+            const getFromRunDataNode = (rd, nodeName, dotPath) => {
+                const json = getNodeJson(rd, nodeName);
                 if (!json)
                     return undefined;
                 const val = getNestedValue(json, dotPath);
-                return val !== undefined ? String(val) : undefined;
+                return val !== undefined && val !== null ? String(val) : undefined;
+            };
+            const pickFirstString = (json, candidates) => {
+                for (const key of candidates) {
+                    const val = getNestedValue(json, key);
+                    if (val && typeof val === 'string')
+                        return val;
+                }
+                return undefined;
             };
             let nativeConvPayload;
             if (nativeConv.inputNode || nativeConv.outputNode || nativeConv.channel) {
@@ -463,15 +474,60 @@ class InsightshubWorkflowReport {
                 if (Object.keys(built).length)
                     nativeConvPayload = built;
             }
+            else if (runData) {
+                const INPUT_CANDIDATES = ['Body', 'body.Body', 'message', 'body.message', 'text', 'body.text', 'query', 'body.query', 'input', 'body.input', 'content', 'body.content'];
+                const ID_CANDIDATES = ['From', 'body.From', 'from', 'body.from', 'userId', 'body.userId', 'sender', 'body.sender', 'phone', 'body.phone'];
+                const OUTPUT_CANDIDATES = ['text', 'output', 'response', 'message', 'answer', 'content', 'result', 'body'];
+                let autoInput;
+                let autoCustomerId;
+                if (triggerName) {
+                    const triggerJson = getNodeJson(runData, triggerName);
+                    if (triggerJson) {
+                        autoInput = pickFirstString(triggerJson, INPUT_CANDIDATES);
+                        autoCustomerId = pickFirstString(triggerJson, ID_CANDIDATES);
+                    }
+                }
+                let maxExecIdx = -1;
+                let lastNodeName;
+                for (const [nodeName, execs] of Object.entries(runData)) {
+                    if (!Array.isArray(execs))
+                        continue;
+                    for (const exec of execs) {
+                        const idx = (_j = exec.executionIndex) !== null && _j !== void 0 ? _j : -1;
+                        if (idx > maxExecIdx) {
+                            const nodeData = exec.data;
+                            const main = nodeData === null || nodeData === void 0 ? void 0 : nodeData.main;
+                            const firstItem = (_k = main === null || main === void 0 ? void 0 : main[0]) === null || _k === void 0 ? void 0 : _k[0];
+                            if ((firstItem === null || firstItem === void 0 ? void 0 : firstItem.json) && Object.keys(firstItem.json).length > 0) {
+                                maxExecIdx = idx;
+                                lastNodeName = nodeName;
+                            }
+                        }
+                    }
+                }
+                let autoOutput;
+                if (lastNodeName) {
+                    const lastJson = getNodeJson(runData, lastNodeName);
+                    if (lastJson)
+                        autoOutput = pickFirstString(lastJson, OUTPUT_CANDIDATES);
+                }
+                const built = {
+                    ...(autoCustomerId ? { customerId: autoCustomerId } : {}),
+                    ...(autoInput ? { input: autoInput } : {}),
+                    ...(autoOutput ? { output: autoOutput } : {}),
+                };
+                if (Object.keys(built).length)
+                    nativeConvPayload = built;
+            }
             body = {
                 projectId,
                 ...(projectName ? { projectName } : {}),
                 environment,
                 workflow: {
                     id: executionData.workflowId,
-                    name: (_j = wfData === null || wfData === void 0 ? void 0 : wfData.name) !== null && _j !== void 0 ? _j : '',
+                    name: (_l = wfData === null || wfData === void 0 ? void 0 : wfData.name) !== null && _l !== void 0 ? _l : '',
                     executionId: String(executionData.id),
-                    status: (_k = executionData.status) !== null && _k !== void 0 ? _k : (executionData.finished ? 'success' : 'unknown'),
+                    status: (_m = executionData.status) !== null && _m !== void 0 ? _m : (executionData.finished ? 'success' : 'unknown'),
                     startedAt: wfStartedAt !== null && wfStartedAt !== void 0 ? wfStartedAt : new Date().toISOString(),
                     ...(wfStoppedAt ? { finishedAt: wfStoppedAt } : {}),
                     durationMs: wfDurationMs,

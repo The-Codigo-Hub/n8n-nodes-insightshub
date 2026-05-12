@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-insightshub",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "N8N nodes for InsightsHub integration",
   "license": "MIT",
   "homepage": "https://github.com/The-Codigo-Hub/n8n-nodes-insightshub",

@@ -322,11 +322,30 @@ export class InsightshubWorkflowReport implements INodeType {
 				});
 			}
 
+			// Map n8n API response fields to InsightHub workflow schema
+			// n8n returns: id, workflowId, workflowData.name, status, startedAt, stoppedAt, mode
+			const wfStartedAt = executionData.startedAt as string | undefined;
+			const wfStoppedAt = executionData.stoppedAt as string | undefined;
+			const wfDurationMs =
+				wfStartedAt && wfStoppedAt
+					? new Date(wfStoppedAt).getTime() - new Date(wfStartedAt).getTime()
+					: 0;
+			const wfData = executionData.workflowData as IDataObject | undefined;
+
 			body = {
 				projectId,
 				...(projectName ? { projectName } : {}),
 				environment,
-				workflow: executionData,
+				workflow: {
+					id: executionData.workflowId,
+					name: wfData?.name ?? '',
+					executionId: String(executionData.id),
+					status: executionData.status ?? (executionData.finished ? 'success' : 'unknown'),
+					startedAt: wfStartedAt ?? new Date().toISOString(),
+					...(wfStoppedAt ? { finishedAt: wfStoppedAt } : {}),
+					durationMs: wfDurationMs,
+					...(executionData.mode ? { trigger: { type: executionData.mode as string } } : {}),
+				},
 			};
 		} else {
 			// Build structured InsightHub payload

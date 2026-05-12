@@ -251,6 +251,7 @@ class InsightshubWorkflowReport {
         };
     }
     async execute() {
+        var _a, _b;
         const items = this.getInputData();
         const payloadMode = this.getNodeParameter('payloadMode', 0, 'structured');
         const credentials = await this.getCredentials('insightshubApi');
@@ -283,11 +284,26 @@ class InsightshubWorkflowReport {
                     message: `Failed to fetch execution ${executionId} from n8n API`,
                 });
             }
+            const wfStartedAt = executionData.startedAt;
+            const wfStoppedAt = executionData.stoppedAt;
+            const wfDurationMs = wfStartedAt && wfStoppedAt
+                ? new Date(wfStoppedAt).getTime() - new Date(wfStartedAt).getTime()
+                : 0;
+            const wfData = executionData.workflowData;
             body = {
                 projectId,
                 ...(projectName ? { projectName } : {}),
                 environment,
-                workflow: executionData,
+                workflow: {
+                    id: executionData.workflowId,
+                    name: (_a = wfData === null || wfData === void 0 ? void 0 : wfData.name) !== null && _a !== void 0 ? _a : '',
+                    executionId: String(executionData.id),
+                    status: (_b = executionData.status) !== null && _b !== void 0 ? _b : (executionData.finished ? 'success' : 'unknown'),
+                    startedAt: wfStartedAt !== null && wfStartedAt !== void 0 ? wfStartedAt : new Date().toISOString(),
+                    ...(wfStoppedAt ? { finishedAt: wfStoppedAt } : {}),
+                    durationMs: wfDurationMs,
+                    ...(executionData.mode ? { trigger: { type: executionData.mode } } : {}),
+                },
             };
         }
         else {

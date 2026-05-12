@@ -4,6 +4,9 @@
   "description": "N8N nodes for InsightsHub integration",
   "license": "MIT",
   "homepage": "https://github.com/The-Codigo-Hub/n8n-nodes-insightshub",
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "n8n-community-node-package"
   ],

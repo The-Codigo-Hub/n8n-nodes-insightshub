@@ -318,7 +318,7 @@ class InsightshubWorkflowReport {
         };
     }
     async execute() {
-        var _a, _b, _c, _d, _e, _f, _g, _h, _j;
+        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
         const items = this.getInputData();
         const payloadMode = this.getNodeParameter('payloadMode', 0, 'structured');
         const credentials = await this.getCredentials('insightshubApi');
@@ -363,15 +363,46 @@ class InsightshubWorkflowReport {
             const triggerName = triggerNode === null || triggerNode === void 0 ? void 0 : triggerNode.name;
             const resultData = (_c = executionData.data) === null || _c === void 0 ? void 0 : _c.resultData;
             const runData = resultData === null || resultData === void 0 ? void 0 : resultData.runData;
+            const wfNodes = wfData === null || wfData === void 0 ? void 0 : wfData.nodes;
+            const nodeTypeMap = {};
+            if (Array.isArray(wfNodes)) {
+                for (const wfNode of wfNodes) {
+                    if (wfNode.name && wfNode.type) {
+                        nodeTypeMap[wfNode.name] = wfNode.type;
+                    }
+                }
+            }
+            const deriveProvider = (nodeType) => {
+                const t = nodeType.toLowerCase();
+                if (t.includes('openai'))
+                    return 'openai';
+                if (t.includes('anthropic'))
+                    return 'anthropic';
+                if (t.includes('gemini') || t.includes('googlevertex') || t.includes('googlepai'))
+                    return 'google';
+                if (t.includes('azure'))
+                    return 'azure-openai';
+                if (t.includes('mistral'))
+                    return 'mistral';
+                if (t.includes('ollama'))
+                    return 'ollama';
+                if (t.includes('cohere'))
+                    return 'cohere';
+                if (t.includes('huggingface') || t.includes('hugging'))
+                    return 'huggingface';
+                return nodeType || 'unknown';
+            };
             const nativeNodes = [];
             const nativeAiUsage = [];
             if (runData) {
                 for (const [nodeName, executions] of Object.entries(runData)) {
                     if (!Array.isArray(executions))
                         continue;
+                    const nType = (_d = nodeTypeMap[nodeName]) !== null && _d !== void 0 ? _d : 'unknown';
                     for (const exec of executions) {
                         nativeNodes.push({
                             name: nodeName,
+                            type: nType,
                             executionIndex: exec.executionIndex,
                             status: exec.executionStatus,
                             executionTime: exec.executionTime,
@@ -379,17 +410,18 @@ class InsightshubWorkflowReport {
                         });
                         const nodeData = exec.data;
                         const aiLM = nodeData === null || nodeData === void 0 ? void 0 : nodeData.ai_languageModel;
-                        const lmJson = ((_d = aiLM === null || aiLM === void 0 ? void 0 : aiLM[0]) === null || _d === void 0 ? void 0 : _d[0]) !== undefined
+                        const lmJson = ((_e = aiLM === null || aiLM === void 0 ? void 0 : aiLM[0]) === null || _e === void 0 ? void 0 : _e[0]) !== undefined
                             ? aiLM[0][0].json
                             : undefined;
                         const tokenUsage = lmJson === null || lmJson === void 0 ? void 0 : lmJson.tokenUsage;
                         if (tokenUsage) {
                             const response = lmJson === null || lmJson === void 0 ? void 0 : lmJson.response;
                             const generations = response === null || response === void 0 ? void 0 : response.generations;
-                            const genInfo = (_f = (_e = generations === null || generations === void 0 ? void 0 : generations[0]) === null || _e === void 0 ? void 0 : _e[0]) === null || _f === void 0 ? void 0 : _f.generationInfo;
+                            const genInfo = (_g = (_f = generations === null || generations === void 0 ? void 0 : generations[0]) === null || _f === void 0 ? void 0 : _f[0]) === null || _g === void 0 ? void 0 : _g.generationInfo;
                             nativeAiUsage.push({
                                 node: nodeName,
-                                model: (_g = genInfo === null || genInfo === void 0 ? void 0 : genInfo.model_name) !== null && _g !== void 0 ? _g : 'unknown',
+                                provider: deriveProvider(nType),
+                                model: (_h = genInfo === null || genInfo === void 0 ? void 0 : genInfo.model_name) !== null && _h !== void 0 ? _h : 'unknown',
                                 promptTokens: tokenUsage.promptTokens,
                                 completionTokens: tokenUsage.completionTokens,
                                 totalTokens: tokenUsage.totalTokens,
@@ -437,9 +469,9 @@ class InsightshubWorkflowReport {
                 environment,
                 workflow: {
                     id: executionData.workflowId,
-                    name: (_h = wfData === null || wfData === void 0 ? void 0 : wfData.name) !== null && _h !== void 0 ? _h : '',
+                    name: (_j = wfData === null || wfData === void 0 ? void 0 : wfData.name) !== null && _j !== void 0 ? _j : '',
                     executionId: String(executionData.id),
-                    status: (_j = executionData.status) !== null && _j !== void 0 ? _j : (executionData.finished ? 'success' : 'unknown'),
+                    status: (_k = executionData.status) !== null && _k !== void 0 ? _k : (executionData.finished ? 'success' : 'unknown'),
                     startedAt: wfStartedAt !== null && wfStartedAt !== void 0 ? wfStartedAt : new Date().toISOString(),
                     ...(wfStoppedAt ? { finishedAt: wfStoppedAt } : {}),
                     durationMs: wfDurationMs,

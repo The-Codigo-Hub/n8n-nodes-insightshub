@@ -412,15 +412,42 @@ export class InsightshubWorkflowReport implements INodeType {
 			const resultData = (executionData.data as IDataObject)?.resultData as IDataObject | undefined;
 			const runData = resultData?.runData as Record<string, IDataObject[]> | undefined;
 
+			// Build name → n8n type lookup from workflowData.nodes
+			const wfNodes = wfData?.nodes as IDataObject[] | undefined;
+			const nodeTypeMap: Record<string, string> = {};
+			if (Array.isArray(wfNodes)) {
+				for (const wfNode of wfNodes) {
+					if (wfNode.name && wfNode.type) {
+						nodeTypeMap[wfNode.name as string] = wfNode.type as string;
+					}
+				}
+			}
+
+			// Derive a human-readable provider from the n8n node type string
+			const deriveProvider = (nodeType: string): string => {
+				const t = nodeType.toLowerCase();
+				if (t.includes('openai')) return 'openai';
+				if (t.includes('anthropic')) return 'anthropic';
+				if (t.includes('gemini') || t.includes('googlevertex') || t.includes('googlepai')) return 'google';
+				if (t.includes('azure')) return 'azure-openai';
+				if (t.includes('mistral')) return 'mistral';
+				if (t.includes('ollama')) return 'ollama';
+				if (t.includes('cohere')) return 'cohere';
+				if (t.includes('huggingface') || t.includes('hugging')) return 'huggingface';
+				return nodeType || 'unknown';
+			};
+
 			const nativeNodes: IDataObject[] = [];
 			const nativeAiUsage: IDataObject[] = [];
 
 			if (runData) {
 				for (const [nodeName, executions] of Object.entries(runData)) {
 					if (!Array.isArray(executions)) continue;
+					const nType = nodeTypeMap[nodeName] ?? 'unknown';
 					for (const exec of executions) {
 						nativeNodes.push({
 							name: nodeName,
+							type: nType,
 							executionIndex: exec.executionIndex,
 							status: exec.executionStatus,
 							executionTime: exec.executionTime,
@@ -441,6 +468,7 @@ export class InsightshubWorkflowReport implements INodeType {
 								?.generationInfo as IDataObject | undefined;
 							nativeAiUsage.push({
 								node: nodeName,
+								provider: deriveProvider(nType),
 								model: genInfo?.model_name ?? 'unknown',
 								promptTokens: tokenUsage.promptTokens,
 								completionTokens: tokenUsage.completionTokens,

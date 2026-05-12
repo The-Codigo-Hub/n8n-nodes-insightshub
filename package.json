@@ -1,10 +1,12 @@
 {
   "name": "n8n-nodes-insightshub",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "N8N nodes for InsightsHub integration",
   "license": "MIT",
   "homepage": "https://github.com/The-Codigo-Hub/n8n-nodes-insightshub",
-  "keywords": ["n8n-community-node-package"],
+  "keywords": [
+    "n8n-community-node-package"
+  ],
   "author": {
     "name": "Nicolas Schnitman",
     "email": "nicolas@thecodigohub.com"
@@ -22,11 +24,15 @@
     "release": "n8n-node release",
     "prepublishOnly": "n8n-node prerelease"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "n8n": {
     "n8nNodesApiVersion": 1,
     "strict": true,
-    "credentials": ["dist/credentials/InsightshubApi.credentials.js"],
+    "credentials": [
+      "dist/credentials/InsightshubApi.credentials.js"
+    ],
     "nodes": [
       "dist/nodes/InsightshubWorkflowReport/InsightshubWorkflowReport.node.js"
     ]
@@ -38,5 +44,7 @@
     "release-it": "^19.0.4",
     "typescript": "5.9.2"
   },
-  "peerDependencies": { "n8n-workflow": "*" }
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  }
 }

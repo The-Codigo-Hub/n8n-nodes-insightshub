@@ -113,6 +113,75 @@ export class InsightshubWorkflowReport implements INodeType {
 				description: 'N8n API key with permission to read executions (Settings → API)',
 			},
 
+			// ── Native mode: conversation extraction ────────────────────────────────
+			{
+				displayName: 'Conversation',
+				name: 'nativeConversation',
+				type: 'collection',
+				displayOptions: { show: { payloadMode: ['native'] } },
+				placeholder: 'Add Conversation Data',
+				default: {},
+				description: 'Optional: extract conversation input/output from execution run data',
+				options: [
+					{
+						displayName: 'Channel',
+						name: 'channel',
+						type: 'string',
+						default: '',
+						placeholder: 'whatsapp',
+						description: 'Communication channel (e.g. whatsapp, telegram, web)',
+					},
+					{
+						displayName: 'Customer ID Path',
+						name: 'customerIdPath',
+						type: 'string',
+						default: '',
+						placeholder: 'body.userId',
+						description: 'Dot-path to the customer/user ID in the input node\'s first output JSON (e.g. body.userId)',
+					},
+					{
+						displayName: 'Input Node',
+						name: 'inputNode',
+						type: 'string',
+						default: '',
+						placeholder: 'Webhook',
+						description: 'Name of the node whose first output contains the user input (as it appears in runData)',
+					},
+					{
+						displayName: 'Input Path',
+						name: 'inputPath',
+						type: 'string',
+						default: '',
+						placeholder: 'body.message',
+						description: 'Dot-path to the input text within that node\'s JSON output (e.g. body.message)',
+					},
+					{
+						displayName: 'Language',
+						name: 'language',
+						type: 'string',
+						default: '',
+						placeholder: 'es',
+						description: 'BCP-47 language code (e.g. en, es, pt)',
+					},
+					{
+						displayName: 'Output Node',
+						name: 'outputNode',
+						type: 'string',
+						default: '',
+						placeholder: 'Code',
+						description: 'Name of the node whose first output contains the assistant response',
+					},
+					{
+						displayName: 'Output Path',
+						name: 'outputPath',
+						type: 'string',
+						default: '',
+						placeholder: 'text',
+						description: 'Dot-path to the output text within that node\'s JSON output (e.g. text)',
+					},
+				],
+			},
+
 			// ── Structured mode: additional required fields ──────────────────────────
 
 			// ── Structured mode: optional project fields ─────────────────────────────
@@ -323,7 +392,8 @@ export class InsightshubWorkflowReport implements INodeType {
 			}
 
 			// Map n8n API response fields to InsightHub workflow schema
-			// n8n returns: id, workflowId, workflowData.name, status, startedAt, stoppedAt, mode
+			// Response shape: { id, workflowId, workflowData, status, startedAt, stoppedAt, mode,
+			//                   data: { resultData: { runData }, runtimeData } }
 			const wfStartedAt = executionData.startedAt as string | undefined;
 			const wfStoppedAt = executionData.stoppedAt as string | undefined;
 			const wfDurationMs =
@@ -331,6 +401,94 @@ export class InsightshubWorkflowReport implements INodeType {
 					? new Date(wfStoppedAt).getTime() - new Date(wfStartedAt).getTime()
 					: 0;
 			const wfData = executionData.workflowData as IDataObject | undefined;
+
+			// ── Trigger info ────────────────────────────────────────────────────────
+			const runtimeData = (executionData.data as IDataObject)?.runtimeData as IDataObject | undefined;
+			const triggerNode = runtimeData?.triggerNode as IDataObject | undefined;
+			const triggerType = (executionData.mode as string | undefined) ?? (runtimeData?.source as string | undefined);
+			const triggerName = triggerNode?.name as string | undefined;
+
+			// ── Node telemetry & AI usage from runData ────────────────────────────
+			const resultData = (executionData.data as IDataObject)?.resultData as IDataObject | undefined;
+			const runData = resultData?.runData as Record<string, IDataObject[]> | undefined;
+
+			const nativeNodes: IDataObject[] = [];
+			const nativeAiUsage: IDataObject[] = [];
+
+			if (runData) {
+				for (const [nodeName, executions] of Object.entries(runData)) {
+					if (!Array.isArray(executions)) continue;
+					for (const exec of executions) {
+						nativeNodes.push({
+							name: nodeName,
+							executionIndex: exec.executionIndex,
+							status: exec.executionStatus,
+							executionTime: exec.executionTime,
+							startTime: exec.startTime,
+						});
+
+						// Extract token usage from ai_languageModel outputs
+						const nodeData = exec.data as IDataObject | undefined;
+						const aiLM = nodeData?.ai_languageModel as unknown[][] | undefined;
+						const lmJson = aiLM?.[0]?.[0] !== undefined
+							? ((aiLM[0][0] as IDataObject).json as IDataObject | undefined)
+							: undefined;
+						const tokenUsage = lmJson?.tokenUsage as IDataObject | undefined;
+						if (tokenUsage) {
+							const response = lmJson?.response as IDataObject | undefined;
+							const generations = response?.generations as unknown[][] | undefined;
+							const genInfo = (generations?.[0]?.[0] as IDataObject | undefined)
+								?.generationInfo as IDataObject | undefined;
+							nativeAiUsage.push({
+								node: nodeName,
+								model: genInfo?.model_name ?? 'unknown',
+								promptTokens: tokenUsage.promptTokens,
+								completionTokens: tokenUsage.completionTokens,
+								totalTokens: tokenUsage.totalTokens,
+							});
+						}
+					}
+				}
+			}
+
+			// ── Conversation extraction ───────────────────────────────────────────────
+			const nativeConv = this.getNodeParameter('nativeConversation', 0, {}) as IDataObject;
+
+			const getNestedValue = (obj: IDataObject, path: string): unknown =>
+				path.split('.').reduce((acc: unknown, key: string) =>
+					(acc && typeof acc === 'object' ? (acc as IDataObject)[key] : undefined), obj as unknown);
+
+			const getFromRunDataNode = (
+				rd: Record<string, IDataObject[]> | undefined,
+				nodeName: string,
+				dotPath: string,
+			): string | undefined => {
+				if (!rd || !nodeName || !dotPath) return undefined;
+				const nodeExecs = rd[nodeName];
+				if (!Array.isArray(nodeExecs) || !nodeExecs.length) return undefined;
+				const nodeData = nodeExecs[0].data as IDataObject | undefined;
+				const main = nodeData?.main as unknown[][] | undefined;
+				const firstItem = main?.[0]?.[0] as IDataObject | undefined;
+				const json = firstItem?.json as IDataObject | undefined;
+				if (!json) return undefined;
+				const val = getNestedValue(json, dotPath);
+				return val !== undefined ? String(val) : undefined;
+			};
+
+			let nativeConvPayload: IDataObject | undefined;
+			if (nativeConv.inputNode || nativeConv.outputNode || nativeConv.channel) {
+				const convInput = getFromRunDataNode(runData, nativeConv.inputNode as string, nativeConv.inputPath as string);
+				const convOutput = getFromRunDataNode(runData, nativeConv.outputNode as string, nativeConv.outputPath as string);
+				const convCustomerId = getFromRunDataNode(runData, nativeConv.inputNode as string, nativeConv.customerIdPath as string);
+				const built: IDataObject = {
+					...(nativeConv.channel ? { channel: nativeConv.channel } : {}),
+					...(convCustomerId ? { customerId: convCustomerId } : {}),
+					...(convInput ? { input: convInput } : {}),
+					...(nativeConv.language ? { language: nativeConv.language } : {}),
+					...(convOutput ? { output: convOutput } : {}),
+				};
+				if (Object.keys(built).length) nativeConvPayload = built;
+			}
 
 			body = {
 				projectId,
@@ -344,8 +502,15 @@ export class InsightshubWorkflowReport implements INodeType {
 					startedAt: wfStartedAt ?? new Date().toISOString(),
 					...(wfStoppedAt ? { finishedAt: wfStoppedAt } : {}),
 					durationMs: wfDurationMs,
-					...(executionData.mode ? { trigger: { type: executionData.mode as string } } : {}),
+					trigger: {
+						type: triggerType ?? 'unknown',
+						...(triggerName ? { name: triggerName } : {}),
+					},
 				},
+				...(nativeConvPayload ? { conversation: nativeConvPayload } : {}),
+				...(nativeAiUsage.length ? { aiUsage: nativeAiUsage } : {}),
+				...(nativeNodes.length ? { nodes: nativeNodes } : {}),
+				metadata: { source: 'n8n-native' },
 			};
 		} else {
 			// Build structured InsightHub payload

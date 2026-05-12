@@ -96,6 +96,73 @@ class InsightshubWorkflowReport {
                     description: 'N8n API key with permission to read executions (Settings → API)',
                 },
                 {
+                    displayName: 'Conversation',
+                    name: 'nativeConversation',
+                    type: 'collection',
+                    displayOptions: { show: { payloadMode: ['native'] } },
+                    placeholder: 'Add Conversation Data',
+                    default: {},
+                    description: 'Optional: extract conversation input/output from execution run data',
+                    options: [
+                        {
+                            displayName: 'Channel',
+                            name: 'channel',
+                            type: 'string',
+                            default: '',
+                            placeholder: 'whatsapp',
+                            description: 'Communication channel (e.g. whatsapp, telegram, web)',
+                        },
+                        {
+                            displayName: 'Customer ID Path',
+                            name: 'customerIdPath',
+                            type: 'string',
+                            default: '',
+                            placeholder: 'body.userId',
+                            description: 'Dot-path to the customer/user ID in the input node\'s first output JSON (e.g. body.userId)',
+                        },
+                        {
+                            displayName: 'Input Node',
+                            name: 'inputNode',
+                            type: 'string',
+                            default: '',
+                            placeholder: 'Webhook',
+                            description: 'Name of the node whose first output contains the user input (as it appears in runData)',
+                        },
+                        {
+                            displayName: 'Input Path',
+                            name: 'inputPath',
+                            type: 'string',
+                            default: '',
+                            placeholder: 'body.message',
+                            description: 'Dot-path to the input text within that node\'s JSON output (e.g. body.message)',
+                        },
+                        {
+                            displayName: 'Language',
+                            name: 'language',
+                            type: 'string',
+                            default: '',
+                            placeholder: 'es',
+                            description: 'BCP-47 language code (e.g. en, es, pt)',
+                        },
+                        {
+                            displayName: 'Output Node',
+                            name: 'outputNode',
+                            type: 'string',
+                            default: '',
+                            placeholder: 'Code',
+                            description: 'Name of the node whose first output contains the assistant response',
+                        },
+                        {
+                            displayName: 'Output Path',
+                            name: 'outputPath',
+                            type: 'string',
+                            default: '',
+                            placeholder: 'text',
+                            description: 'Dot-path to the output text within that node\'s JSON output (e.g. text)',
+                        },
+                    ],
+                },
+                {
                     displayName: 'Project Name',
                     name: 'projectName',
                     type: 'string',
@@ -251,7 +318,7 @@ class InsightshubWorkflowReport {
         };
     }
     async execute() {
-        var _a, _b;
+        var _a, _b, _c, _d, _e, _f, _g, _h, _j;
         const items = this.getInputData();
         const payloadMode = this.getNodeParameter('payloadMode', 0, 'structured');
         const credentials = await this.getCredentials('insightshubApi');
@@ -290,20 +357,101 @@ class InsightshubWorkflowReport {
                 ? new Date(wfStoppedAt).getTime() - new Date(wfStartedAt).getTime()
                 : 0;
             const wfData = executionData.workflowData;
+            const runtimeData = (_a = executionData.data) === null || _a === void 0 ? void 0 : _a.runtimeData;
+            const triggerNode = runtimeData === null || runtimeData === void 0 ? void 0 : runtimeData.triggerNode;
+            const triggerType = (_b = executionData.mode) !== null && _b !== void 0 ? _b : runtimeData === null || runtimeData === void 0 ? void 0 : runtimeData.source;
+            const triggerName = triggerNode === null || triggerNode === void 0 ? void 0 : triggerNode.name;
+            const resultData = (_c = executionData.data) === null || _c === void 0 ? void 0 : _c.resultData;
+            const runData = resultData === null || resultData === void 0 ? void 0 : resultData.runData;
+            const nativeNodes = [];
+            const nativeAiUsage = [];
+            if (runData) {
+                for (const [nodeName, executions] of Object.entries(runData)) {
+                    if (!Array.isArray(executions))
+                        continue;
+                    for (const exec of executions) {
+                        nativeNodes.push({
+                            name: nodeName,
+                            executionIndex: exec.executionIndex,
+                            status: exec.executionStatus,
+                            executionTime: exec.executionTime,
+                            startTime: exec.startTime,
+                        });
+                        const nodeData = exec.data;
+                        const aiLM = nodeData === null || nodeData === void 0 ? void 0 : nodeData.ai_languageModel;
+                        const lmJson = ((_d = aiLM === null || aiLM === void 0 ? void 0 : aiLM[0]) === null || _d === void 0 ? void 0 : _d[0]) !== undefined
+                            ? aiLM[0][0].json
+                            : undefined;
+                        const tokenUsage = lmJson === null || lmJson === void 0 ? void 0 : lmJson.tokenUsage;
+                        if (tokenUsage) {
+                            const response = lmJson === null || lmJson === void 0 ? void 0 : lmJson.response;
+                            const generations = response === null || response === void 0 ? void 0 : response.generations;
+                            const genInfo = (_f = (_e = generations === null || generations === void 0 ? void 0 : generations[0]) === null || _e === void 0 ? void 0 : _e[0]) === null || _f === void 0 ? void 0 : _f.generationInfo;
+                            nativeAiUsage.push({
+                                node: nodeName,
+                                model: (_g = genInfo === null || genInfo === void 0 ? void 0 : genInfo.model_name) !== null && _g !== void 0 ? _g : 'unknown',
+                                promptTokens: tokenUsage.promptTokens,
+                                completionTokens: tokenUsage.completionTokens,
+                                totalTokens: tokenUsage.totalTokens,
+                            });
+                        }
+                    }
+                }
+            }
+            const nativeConv = this.getNodeParameter('nativeConversation', 0, {});
+            const getNestedValue = (obj, path) => path.split('.').reduce((acc, key) => (acc && typeof acc === 'object' ? acc[key] : undefined), obj);
+            const getFromRunDataNode = (rd, nodeName, dotPath) => {
+                var _a;
+                if (!rd || !nodeName || !dotPath)
+                    return undefined;
+                const nodeExecs = rd[nodeName];
+                if (!Array.isArray(nodeExecs) || !nodeExecs.length)
+                    return undefined;
+                const nodeData = nodeExecs[0].data;
+                const main = nodeData === null || nodeData === void 0 ? void 0 : nodeData.main;
+                const firstItem = (_a = main === null || main === void 0 ? void 0 : main[0]) === null || _a === void 0 ? void 0 : _a[0];
+                const json = firstItem === null || firstItem === void 0 ? void 0 : firstItem.json;
+                if (!json)
+                    return undefined;
+                const val = getNestedValue(json, dotPath);
+                return val !== undefined ? String(val) : undefined;
+            };
+            let nativeConvPayload;
+            if (nativeConv.inputNode || nativeConv.outputNode || nativeConv.channel) {
+                const convInput = getFromRunDataNode(runData, nativeConv.inputNode, nativeConv.inputPath);
+                const convOutput = getFromRunDataNode(runData, nativeConv.outputNode, nativeConv.outputPath);
+                const convCustomerId = getFromRunDataNode(runData, nativeConv.inputNode, nativeConv.customerIdPath);
+                const built = {
+                    ...(nativeConv.channel ? { channel: nativeConv.channel } : {}),
+                    ...(convCustomerId ? { customerId: convCustomerId } : {}),
+                    ...(convInput ? { input: convInput } : {}),
+                    ...(nativeConv.language ? { language: nativeConv.language } : {}),
+                    ...(convOutput ? { output: convOutput } : {}),
+                };
+                if (Object.keys(built).length)
+                    nativeConvPayload = built;
+            }
             body = {
                 projectId,
                 ...(projectName ? { projectName } : {}),
                 environment,
                 workflow: {
                     id: executionData.workflowId,
-                    name: (_a = wfData === null || wfData === void 0 ? void 0 : wfData.name) !== null && _a !== void 0 ? _a : '',
+                    name: (_h = wfData === null || wfData === void 0 ? void 0 : wfData.name) !== null && _h !== void 0 ? _h : '',
                     executionId: String(executionData.id),
-                    status: (_b = executionData.status) !== null && _b !== void 0 ? _b : (executionData.finished ? 'success' : 'unknown'),
+                    status: (_j = executionData.status) !== null && _j !== void 0 ? _j : (executionData.finished ? 'success' : 'unknown'),
                     startedAt: wfStartedAt !== null && wfStartedAt !== void 0 ? wfStartedAt : new Date().toISOString(),
                     ...(wfStoppedAt ? { finishedAt: wfStoppedAt } : {}),
                     durationMs: wfDurationMs,
-                    ...(executionData.mode ? { trigger: { type: executionData.mode } } : {}),
+                    trigger: {
+                        type: triggerType !== null && triggerType !== void 0 ? triggerType : 'unknown',
+                        ...(triggerName ? { name: triggerName } : {}),
+                    },
                 },
+                ...(nativeConvPayload ? { conversation: nativeConvPayload } : {}),
+                ...(nativeAiUsage.length ? { aiUsage: nativeAiUsage } : {}),
+                ...(nativeNodes.length ? { nodes: nativeNodes } : {}),
+                metadata: { source: 'n8n-native' },
             };
         }
         else {

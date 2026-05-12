@@ -537,9 +537,9 @@ export class InsightshubWorkflowReport implements INodeType {
 				if (Object.keys(built).length) nativeConvPayload = built;
 			} else if (runData) {
 				// ── Auto-detect: no manual config provided ─────────────────────────────
-				const INPUT_CANDIDATES = ['Body', 'body.Body', 'message', 'body.message', 'text', 'body.text', 'query', 'body.query', 'input', 'body.input', 'content', 'body.content'];
-				const ID_CANDIDATES = ['From', 'body.From', 'from', 'body.from', 'userId', 'body.userId', 'sender', 'body.sender', 'phone', 'body.phone'];
-				const OUTPUT_CANDIDATES = ['text', 'output', 'response', 'message', 'answer', 'content', 'result', 'body'];
+				const INPUT_CANDIDATES = ['body.message', 'body.Body', 'body.text', 'body.query', 'body.input', 'body.content', 'message', 'text', 'query', 'input', 'content'];
+				const ID_CANDIDATES = ['body.userId', 'body.From', 'body.from', 'body.phone', 'body.sender', 'body.conversationId', 'body.chatId', 'body.sessionId', 'userId', 'From', 'from', 'phone', 'sender'];
+				const OUTPUT_CANDIDATES = ['text', 'output', 'response', 'message', 'answer', 'content', 'result'];
 
 				// Auto-input: from trigger node
 				let autoInput: string | undefined;
@@ -552,29 +552,25 @@ export class InsightshubWorkflowReport implements INodeType {
 					}
 				}
 
-				// Auto-output: from the node with the highest executionIndex that has a main output
+				// Auto-output: find the node with the highest executionIndex that has one of the output candidates
 				let maxExecIdx = -1;
-				let lastNodeName: string | undefined;
-				for (const [nodeName, execs] of Object.entries(runData)) {
+				let autoOutput: string | undefined;
+				for (const [, execs] of Object.entries(runData)) {
 					if (!Array.isArray(execs)) continue;
 					for (const exec of execs) {
 						const idx = (exec.executionIndex as number) ?? -1;
-						if (idx > maxExecIdx) {
-							const nodeData = exec.data as IDataObject | undefined;
-							const main = nodeData?.main as unknown[][] | undefined;
-							const firstItem = main?.[0]?.[0] as IDataObject | undefined;
-							if (firstItem?.json && Object.keys(firstItem.json as object).length > 0) {
-								maxExecIdx = idx;
-								lastNodeName = nodeName;
-							}
+						if (idx <= maxExecIdx) continue;
+						const nodeData = exec.data as IDataObject | undefined;
+						const main = nodeData?.main as unknown[][] | undefined;
+						const firstItem = main?.[0]?.[0] as IDataObject | undefined;
+						const json = firstItem?.json as IDataObject | undefined;
+						if (!json) continue;
+						const match = pickFirstString(json, OUTPUT_CANDIDATES);
+						if (match) {
+							maxExecIdx = idx;
+							autoOutput = match;
 						}
 					}
-				}
-
-				let autoOutput: string | undefined;
-				if (lastNodeName) {
-					const lastJson = getNodeJson(runData, lastNodeName);
-					if (lastJson) autoOutput = pickFirstString(lastJson, OUTPUT_CANDIDATES);
 				}
 
 				const built: IDataObject = {

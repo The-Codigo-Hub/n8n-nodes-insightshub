@@ -41,7 +41,14 @@ export class InsightshubWorkflowReport implements INodeType {
 		},
 		inputs: [NodeConnectionTypes.Main],
 		outputs: [NodeConnectionTypes.Main],
-		credentials: [{ name: 'insightshubApi', required: true }],
+		credentials: [
+			{ name: 'insightshubApi', required: true },
+			{
+				name: 'insightshubN8nApi',
+				required: true,
+				displayOptions: { show: { payloadMode: ['native'] } },
+			},
+		],
 		usableAsTool: true,
 		properties: [
 			// ── Payload mode ────────────────────────────────────────────────────────
@@ -55,7 +62,7 @@ export class InsightshubWorkflowReport implements INodeType {
 						name: 'Native N8n Execution',
 						value: 'native',
 						description:
-							'Forward native n8n execution object(s) directly from input items',
+							'Fetch the current execution from the n8n API and send it as-is (recommended)',
 					},
 					{
 						name: 'Structured',
@@ -91,37 +98,24 @@ export class InsightshubWorkflowReport implements INodeType {
 				description: 'Deployment environment for this workflow execution',
 			},
 
-			// ── Native mode: n8n API connection ─────────────────────────────────────
+			// ── Native mode: conversation overrides ─────────────────────────────────
 			{
-				displayName: 'N8n Base URL',
-				name: 'n8nBaseUrl',
-				type: 'string',
+				displayName:
+					'In Native mode the full execution is sent to InsightsHub, which detects the conversation automatically. The workflow must have "Save execution progress" enabled in its settings.',
+				name: 'nativeNotice',
+				type: 'notice',
 				displayOptions: { show: { payloadMode: ['native'] } },
-				required: true,
-				default: 'http://localhost:5678',
-				placeholder: 'http://localhost:5678',
-				description: 'Base URL of your n8n instance (used to call /api/v1/executions)',
-			},
-			{
-				displayName: 'N8n API Key',
-				name: 'n8nApiKey',
-				type: 'string',
-				typeOptions: { password: true },
-				displayOptions: { show: { payloadMode: ['native'] } },
-				required: true,
 				default: '',
-				description: 'N8n API key with permission to read executions (Settings → API)',
 			},
-
-			// ── Native mode: conversation extraction ────────────────────────────────
 			{
-				displayName: 'Conversation',
-				name: 'nativeConversation',
+				displayName: 'Conversation Overrides',
+				name: 'conversationOverrides',
 				type: 'collection',
 				displayOptions: { show: { payloadMode: ['native'] } },
-				placeholder: 'Add Conversation Data',
+				placeholder: 'Add Override',
 				default: {},
-				description: 'Optional: extract conversation input/output from execution run data',
+				description:
+					"Optional values that take precedence over the automatic conversation detection. Use expressions, e.g. {{ $('Webhook').first().JSON.body.userId }}.",
 				options: [
 					{
 						displayName: 'Channel',
@@ -132,28 +126,19 @@ export class InsightshubWorkflowReport implements INodeType {
 						description: 'Communication channel (e.g. whatsapp, telegram, web)',
 					},
 					{
-						displayName: 'Customer ID Path',
-						name: 'customerIdPath',
+						displayName: 'Conversation ID',
+						name: 'conversationId',
 						type: 'string',
 						default: '',
-						placeholder: 'body.userId',
-						description: 'Dot-path to the customer/user ID in the input node\'s first output JSON (e.g. body.userId)',
+						description: 'Identifier of the conversation or session',
 					},
 					{
-						displayName: 'Input Node',
-						name: 'inputNode',
+						displayName: 'Input',
+						name: 'input',
 						type: 'string',
+						typeOptions: { rows: 3 },
 						default: '',
-						placeholder: 'Webhook',
-						description: 'Name of the node whose first output contains the user input (as it appears in runData)',
-					},
-					{
-						displayName: 'Input Path',
-						name: 'inputPath',
-						type: 'string',
-						default: '',
-						placeholder: 'body.message',
-						description: 'Dot-path to the input text within that node\'s JSON output (e.g. body.message)',
+						description: 'User message or input text',
 					},
 					{
 						displayName: 'Language',
@@ -164,20 +149,20 @@ export class InsightshubWorkflowReport implements INodeType {
 						description: 'BCP-47 language code (e.g. en, es, pt)',
 					},
 					{
-						displayName: 'Output Node',
-						name: 'outputNode',
+						displayName: 'Output',
+						name: 'output',
 						type: 'string',
+						typeOptions: { rows: 3 },
 						default: '',
-						placeholder: 'Code',
-						description: 'Name of the node whose first output contains the assistant response',
+						description: 'Assistant response or output text',
 					},
 					{
-						displayName: 'Output Path',
-						name: 'outputPath',
+						displayName: 'User ID',
+						name: 'userId',
 						type: 'string',
 						default: '',
-						placeholder: 'text',
-						description: 'Dot-path to the output text within that node\'s JSON output (e.g. text)',
+						placeholder: '5491100000000',
+						description: 'Identifier of the end user (phone, WhatsApp ID, email, etc.)',
 					},
 				],
 			},
@@ -198,10 +183,9 @@ export class InsightshubWorkflowReport implements INodeType {
 				displayName: 'Client ID',
 				name: 'clientId',
 				type: 'number',
-				displayOptions: { show: { payloadMode: ['structured'] } },
+				displayOptions: { show: { payloadMode: ['structured', 'native'] } },
 				default: 0,
-				description:
-					'Numeric client identifier (optional). Leave as 0 to omit from the payload.',
+				description: 'Numeric client identifier (optional). Leave as 0 to omit from the payload.',
 			},
 
 			// ── Structured mode: workflow details ────────────────────────────────────
@@ -357,358 +341,209 @@ export class InsightshubWorkflowReport implements INodeType {
 		const credentials = await this.getCredentials('insightshubApi');
 		const baseUrl = (credentials.baseUrl as string).replace(/\/+$/, '');
 
-		let body: IDataObject | IDataObject[];
-
-		if (payloadMode === 'native') {
-			const projectId = this.getNodeParameter('projectId', 0, '') as string;
-			if (!projectId) {
-				throw new NodeOperationError(this.getNode(), 'Project ID is required');
-			}
-			const environment = this.getNodeParameter('environment', 0, 'prod') as string;
-			const projectName = this.getNodeParameter('projectName', 0, '') as string;
-			const n8nBaseUrl = (this.getNodeParameter('n8nBaseUrl', 0, '') as string).replace(/\/+$/, '');
-			const n8nApiKey = this.getNodeParameter('n8nApiKey', 0, '') as string;
-
-			if (!n8nBaseUrl || !n8nApiKey) {
-				throw new NodeOperationError(this.getNode(), 'N8n Base URL and API Key are required for Native mode');
-			}
-
-			const executionId = this.getExecutionId();
-
-			let executionData: IDataObject;
-			try {
-				// Reason: the n8n API key is a user-supplied node parameter, not a managed credential.
-				// eslint-disable-next-line @n8n/community-nodes/no-http-request-with-manual-auth
-				executionData = await this.helpers.httpRequest({
-					method: 'GET',
-					url: `${n8nBaseUrl}/api/v1/executions/${executionId}?includeData=true`,
-					headers: { 'X-N8N-API-KEY': n8nApiKey },
-					json: true,
-				}) as IDataObject;
-			} catch (error) {
-				throw new NodeApiError(this.getNode(), error as JsonObject, {
-					message: `Failed to fetch execution ${executionId} from n8n API`,
-				});
-			}
-
-			// Map n8n API response fields to InsightHub workflow schema
-			// Response shape: { id, workflowId, workflowData, status, startedAt, stoppedAt, mode,
-			//                   data: { resultData: { runData }, runtimeData } }
-			const wfStartedAt = executionData.startedAt as string | undefined;
-			const wfStoppedAt = executionData.stoppedAt as string | undefined;
-			const wfDurationMs =
-				wfStartedAt && wfStoppedAt
-					? new Date(wfStoppedAt).getTime() - new Date(wfStartedAt).getTime()
-					: 0;
-			const wfData = executionData.workflowData as IDataObject | undefined;
-
-			// ── Trigger info ────────────────────────────────────────────────────────
-			const runtimeData = (executionData.data as IDataObject)?.runtimeData as IDataObject | undefined;
-			const triggerNode = runtimeData?.triggerNode as IDataObject | undefined;
-			const triggerType = (executionData.mode as string | undefined) ?? (runtimeData?.source as string | undefined);
-			const triggerName = triggerNode?.name as string | undefined;
-
-			// ── Node telemetry & AI usage from runData ────────────────────────────
-			const resultData = (executionData.data as IDataObject)?.resultData as IDataObject | undefined;
-			const runData = resultData?.runData as Record<string, IDataObject[]> | undefined;
-
-			// Build name → n8n type lookup from workflowData.nodes
-			const wfNodes = wfData?.nodes as IDataObject[] | undefined;
-			const nodeTypeMap: Record<string, string> = {};
-			if (Array.isArray(wfNodes)) {
-				for (const wfNode of wfNodes) {
-					if (wfNode.name && wfNode.type) {
-						nodeTypeMap[wfNode.name as string] = wfNode.type as string;
-					}
-				}
-			}
-
-			// Derive a human-readable provider from the n8n node type string
-			const deriveProvider = (nodeType: string): string => {
-				const t = nodeType.toLowerCase();
-				if (t.includes('openai')) return 'openai';
-				if (t.includes('anthropic')) return 'anthropic';
-				if (t.includes('gemini') || t.includes('googlevertex') || t.includes('googlepai')) return 'google';
-				if (t.includes('azure')) return 'azure-openai';
-				if (t.includes('mistral')) return 'mistral';
-				if (t.includes('ollama')) return 'ollama';
-				if (t.includes('cohere')) return 'cohere';
-				if (t.includes('huggingface') || t.includes('hugging')) return 'huggingface';
-				return nodeType || 'unknown';
-			};
-
-			const nativeNodes: IDataObject[] = [];
-			const nativeAiUsage: IDataObject[] = [];
-
-			if (runData) {
-				for (const [nodeName, executions] of Object.entries(runData)) {
-					if (!Array.isArray(executions)) continue;
-					const nType = nodeTypeMap[nodeName] ?? 'unknown';
-					for (const exec of executions) {
-						nativeNodes.push({
-							name: nodeName,
-							type: nType,
-							executionIndex: exec.executionIndex,
-							status: exec.executionStatus,
-							executionTime: exec.executionTime,
-							startTime: exec.startTime,
-						});
-
-						// Extract token usage from ai_languageModel outputs
-						const nodeData = exec.data as IDataObject | undefined;
-						const aiLM = nodeData?.ai_languageModel as unknown[][] | undefined;
-						const lmJson = aiLM?.[0]?.[0] !== undefined
-							? ((aiLM[0][0] as IDataObject).json as IDataObject | undefined)
-							: undefined;
-						const tokenUsage = lmJson?.tokenUsage as IDataObject | undefined;
-						if (tokenUsage) {
-							const response = lmJson?.response as IDataObject | undefined;
-							const generations = response?.generations as unknown[][] | undefined;
-							const genInfo = (generations?.[0]?.[0] as IDataObject | undefined)
-								?.generationInfo as IDataObject | undefined;
-							nativeAiUsage.push({
-								node: nodeName,
-								provider: deriveProvider(nType),
-								model: genInfo?.model_name ?? 'unknown',
-								promptTokens: tokenUsage.promptTokens,
-								completionTokens: tokenUsage.completionTokens,
-								totalTokens: tokenUsage.totalTokens,
-							});
-						}
-					}
-				}
-			}
-
-			// ── Conversation extraction ───────────────────────────────────────────────
-			const nativeConv = this.getNodeParameter('nativeConversation', 0, {}) as IDataObject;
-
-			// Helper: read a dot-path from a runData node's first output JSON
-			const getNestedValue = (obj: IDataObject, path: string): unknown =>
-				path.split('.').reduce((acc: unknown, key: string) =>
-					(acc && typeof acc === 'object' ? (acc as IDataObject)[key] : undefined), obj as unknown);
-
-			const getNodeJson = (
-				rd: Record<string, IDataObject[]> | undefined,
-				nodeName: string,
-			): IDataObject | undefined => {
-				if (!rd || !nodeName) return undefined;
-				const nodeExecs = rd[nodeName];
-				if (!Array.isArray(nodeExecs) || !nodeExecs.length) return undefined;
-				const nodeData = nodeExecs[0].data as IDataObject | undefined;
-				const main = nodeData?.main as unknown[][] | undefined;
-				const firstItem = main?.[0]?.[0] as IDataObject | undefined;
-				return firstItem?.json as IDataObject | undefined;
-			};
-
-			const getFromRunDataNode = (
-				rd: Record<string, IDataObject[]> | undefined,
-				nodeName: string,
-				dotPath: string,
-			): string | undefined => {
-				const json = getNodeJson(rd, nodeName);
-				if (!json) return undefined;
-				const val = getNestedValue(json, dotPath);
-				return val !== undefined && val !== null ? String(val) : undefined;
-			};
-
-			// Helper: pick first matching string field from a JSON object
-			const pickFirstString = (json: IDataObject, candidates: string[]): string | undefined => {
-				for (const key of candidates) {
-					const val = getNestedValue(json, key);
-					if (val && typeof val === 'string') return val;
-				}
-				return undefined;
-			};
-
-			let nativeConvPayload: IDataObject | undefined;
-
-			if (nativeConv.inputNode || nativeConv.outputNode || nativeConv.channel) {
-				// ── Manual config ──────────────────────────────────────────────────────
-				const convInput = getFromRunDataNode(runData, nativeConv.inputNode as string, nativeConv.inputPath as string);
-				const convOutput = getFromRunDataNode(runData, nativeConv.outputNode as string, nativeConv.outputPath as string);
-				const convCustomerId = getFromRunDataNode(runData, nativeConv.inputNode as string, nativeConv.customerIdPath as string);
-				const built: IDataObject = {
-					...(nativeConv.channel ? { channel: nativeConv.channel } : {}),
-					...(convCustomerId ? { customerId: convCustomerId } : {}),
-					...(convInput ? { input: convInput } : {}),
-					...(nativeConv.language ? { language: nativeConv.language } : {}),
-					...(convOutput ? { output: convOutput } : {}),
-				};
-				if (Object.keys(built).length) nativeConvPayload = built;
-			} else if (runData) {
-				// ── Auto-detect: no manual config provided ─────────────────────────────
-				const INPUT_CANDIDATES = ['body.message', 'body.Body', 'body.text', 'body.query', 'body.input', 'body.content', 'message', 'text', 'query', 'input', 'content'];
-				const ID_CANDIDATES = ['body.userId', 'body.From', 'body.from', 'body.phone', 'body.sender', 'body.conversationId', 'body.chatId', 'body.sessionId', 'userId', 'From', 'from', 'phone', 'sender'];
-				const OUTPUT_CANDIDATES = ['text', 'output', 'response', 'message', 'answer', 'content', 'result'];
-
-				// Auto-input: from trigger node
-				let autoInput: string | undefined;
-				let autoCustomerId: string | undefined;
-				if (triggerName) {
-					const triggerJson = getNodeJson(runData, triggerName);
-					if (triggerJson) {
-						autoInput = pickFirstString(triggerJson, INPUT_CANDIDATES);
-						autoCustomerId = pickFirstString(triggerJson, ID_CANDIDATES);
-					}
-				}
-
-				// Auto-output: find the node with the highest executionIndex that has one of the output candidates
-				let maxExecIdx = -1;
-				let autoOutput: string | undefined;
-				for (const [, execs] of Object.entries(runData)) {
-					if (!Array.isArray(execs)) continue;
-					for (const exec of execs) {
-						const idx = (exec.executionIndex as number) ?? -1;
-						if (idx <= maxExecIdx) continue;
-						const nodeData = exec.data as IDataObject | undefined;
-						const main = nodeData?.main as unknown[][] | undefined;
-						const firstItem = main?.[0]?.[0] as IDataObject | undefined;
-						const json = firstItem?.json as IDataObject | undefined;
-						if (!json) continue;
-						const match = pickFirstString(json, OUTPUT_CANDIDATES);
-						if (match) {
-							maxExecIdx = idx;
-							autoOutput = match;
-						}
-					}
-				}
-
-				const built: IDataObject = {
-					...(autoCustomerId ? { customerId: autoCustomerId } : {}),
-					...(autoInput ? { input: autoInput } : {}),
-					...(autoOutput ? { output: autoOutput } : {}),
-				};
-				if (Object.keys(built).length) nativeConvPayload = built;
-			}
-
-			body = {
-				projectId,
-				...(projectName ? { projectName } : {}),
-				environment,
-				workflow: {
-					id: executionData.workflowId,
-					name: wfData?.name ?? '',
-					executionId: String(executionData.id),
-					status: executionData.status ?? (executionData.finished ? 'success' : 'unknown'),
-					startedAt: wfStartedAt ?? new Date().toISOString(),
-					...(wfStoppedAt ? { finishedAt: wfStoppedAt } : {}),
-					durationMs: wfDurationMs,
-					trigger: {
-						type: triggerType ?? 'unknown',
-						...(triggerName ? { name: triggerName } : {}),
-					},
-				},
-				...(nativeConvPayload ? { conversation: nativeConvPayload } : {}),
-				...(nativeAiUsage.length ? { aiUsage: nativeAiUsage } : {}),
-				...(nativeNodes.length ? { nodes: nativeNodes } : {}),
-				metadata: { source: 'n8n-native' },
-			};
-		} else {
-			// Build structured InsightHub payload
-			const projectId = this.getNodeParameter('projectId', 0, '') as string;
-			if (!projectId) {
-				throw new NodeOperationError(this.getNode(), 'Project ID is required');
-			}
-
-			const environment = this.getNodeParameter('environment', 0, 'prod') as string;
-			const projectName = this.getNodeParameter('projectName', 0, '') as string;
-			const clientId = this.getNodeParameter('clientId', 0, 0) as number;
-			const workflowStatus = this.getNodeParameter('workflowStatus', 0, 'success') as string;
-			const startedAtParam = this.getNodeParameter('startedAt', 0, '') as string;
-			const startedAt = startedAtParam || new Date().toISOString();
-			const durationMs = this.getNodeParameter('durationMs', 0, 0) as number;
-			const triggerType = this.getNodeParameter('triggerType', 0, '') as string;
-			const triggerPath = this.getNodeParameter('triggerPath', 0, '') as string;
-			const conversation = this.getNodeParameter('conversation', 0, {}) as Record<
-				string,
-				unknown
-			>;
-			const aiUsage = safeParseJson(this.getNodeParameter('aiUsage', 0, '[]'), []) as unknown[];
-			const nodes = safeParseJson(this.getNodeParameter('nodes', 0, '[]'), []) as unknown[];
-			const errors = safeParseJson(this.getNodeParameter('errors', 0, '[]'), []) as unknown[];
-			const metadata = safeParseJson(this.getNodeParameter('metadata', 0, '{}'), {}) as object;
-
-			const workflow = this.getWorkflow();
-			const executionId = this.getExecutionId();
-
-			const trigger: Record<string, string> = {};
-			if (triggerType) trigger.type = triggerType;
-			if (triggerPath) trigger.path = triggerPath;
-
-			const finishedAt = durationMs
-				? new Date(new Date(startedAt).getTime() + durationMs).toISOString()
-				: undefined;
-
-			const hasConversation = Object.keys(conversation).length > 0;
-			const conversationPayload = hasConversation
-				? {
-						...(conversation.customerId ? { customerId: conversation.customerId } : {}),
-						...(conversation.channel ? { channel: conversation.channel } : {}),
-						...(conversation.input ? { input: conversation.input } : {}),
-						...(conversation.output ? { output: conversation.output } : {}),
-						...(conversation.language ? { language: conversation.language } : {}),
-						metadata: {},
-					}
-				: undefined;
-
-			body = {
-				projectId,
-				...(projectName ? { projectName } : {}),
-				...(clientId > 0 ? { clientId } : {}),
-				environment,
-				workflow: {
-					id: workflow.id,
-					name: workflow.name,
-					executionId,
-					status: workflowStatus,
-					startedAt,
-					...(finishedAt ? { finishedAt } : {}),
-					...(durationMs > 0 ? { durationMs } : {}),
-					...(Object.keys(trigger).length ? { trigger } : {}),
-				},
-				...(conversationPayload ? { conversation: conversationPayload } : {}),
-				...(aiUsage.length ? { aiUsage } : {}),
-				...(nodes.length ? { nodes } : {}),
-				...(errors.length ? { errors } : {}),
-				metadata: { source: 'n8n', ...metadata },
-			};
+		const projectId = this.getNodeParameter('projectId', 0, '') as string;
+		if (!projectId) {
+			throw new NodeOperationError(this.getNode(), 'Project ID is required');
 		}
 
+		let body: IDataObject = {};
 		let apiResponse: IDataObject;
+		// Names the step that failed in error messages
+		let failedStep =
+			payloadMode === 'native'
+				? 'fetch the execution from the n8n API'
+				: 'build the InsightsHub payload';
 		try {
-			apiResponse = await this.helpers.httpRequestWithAuthentication.call(this, 'insightshubApi', {
+			body =
+				payloadMode === 'native'
+					? await buildNativePayload.call(this, projectId)
+					: buildStructuredPayload.call(this, projectId);
+
+			failedStep = 'send the execution to InsightsHub';
+			apiResponse = (await this.helpers.httpRequestWithAuthentication.call(this, 'insightshubApi', {
 				method: 'POST',
 				url: `${baseUrl}/api/n8n/executions/collect`,
-				headers: {
-					'Content-Type': 'application/json',
-				},
+				headers: { 'Content-Type': 'application/json' },
 				body,
 				json: true,
-			}) as IDataObject;
+			})) as IDataObject;
 		} catch (error) {
 			if (this.continueOnFail()) {
 				return [
-					items.map((item, index) => ({
+					items.map((_item, index) => ({
 						json: {
 							success: false,
+							projectId,
+							executionId: this.getExecutionId(),
 							error: (error as Error).message,
-							sentPayload: body,
 						},
 						pairedItem: { item: index },
 					})),
 				];
 			}
-
-			throw new NodeApiError(this.getNode(), error as JsonObject);
+			if (error instanceof NodeOperationError) {
+				throw new NodeOperationError(this.getNode(), error, {
+					description: error.description ?? undefined,
+				});
+			}
+			throw new NodeApiError(this.getNode(), error as JsonObject, {
+				message: `Failed to ${failedStep}`,
+			});
 		}
 
+		// Native payloads embed the whole execution; only echo it back in structured mode
+		// to avoid bloating the stored execution data.
 		const outputJson: IDataObject = {
 			success: true,
+			projectId,
 			...apiResponse,
-			sentPayload: body,
+			...(payloadMode === 'native' ? {} : { sentPayload: body }),
 		};
 
-		return [[{ json: outputJson, pairedItem: { item: 0 } }]];
+		return [items.map((_item, index) => ({ json: outputJson, pairedItem: { item: index } }))];
 	}
 }
 
+const ACTIVE_STATUSES = new Set(['new', 'running', 'waiting', 'unknown']);
+
+function cleanString(value: unknown): string | undefined {
+	if (value === undefined || value === null) return undefined;
+	const text = String(value).trim();
+	return text ? text : undefined;
+}
+
+/**
+ * Fetches the current execution from the n8n API and returns it unmodified, apart from
+ * finalising its status. The InsightsHub backend recognises native executions
+ * (`data.resultData.runData` + `workflowData`) and extracts nodes, AI usage, tool calls,
+ * errors and the conversation itself.
+ */
+async function buildNativePayload(
+	this: IExecuteFunctions,
+	projectId: string,
+): Promise<IDataObject> {
+	const n8nCredentials = await this.getCredentials('insightshubN8nApi');
+	const n8nBaseUrl = (n8nCredentials.baseUrl as string)
+		.replace(/\/+$/, '')
+		.replace(/\/api\/v1$/, '');
+	const executionId = this.getExecutionId();
+
+	const execution = (await this.helpers.httpRequestWithAuthentication.call(
+		this,
+		'insightshubN8nApi',
+		{
+			method: 'GET',
+			url: `${n8nBaseUrl}/api/v1/executions/${executionId}`,
+			qs: { includeData: true },
+			json: true,
+		},
+	)) as IDataObject;
+
+	const data = execution.data as IDataObject | undefined;
+	const resultData = data?.resultData as IDataObject | undefined;
+	const runData = resultData?.runData as IDataObject | undefined;
+	if (!runData || Object.keys(runData).length === 0) {
+		throw new NodeOperationError(this.getNode(), `Execution ${executionId} has no node data yet`, {
+			description:
+				'Enable "Save execution progress" in the workflow settings so the n8n API returns the data of nodes that already ran.',
+		});
+	}
+
+	// This node runs at the end of the workflow, so the snapshot is still "running".
+	// Close it here so InsightsHub stores the final state and duration.
+	const status = cleanString(execution.status);
+	const finalised: IDataObject = {};
+	if (!status || ACTIVE_STATUSES.has(status)) {
+		finalised.status = resultData?.error ? 'error' : 'success';
+		finalised.finished = !resultData?.error;
+		finalised.stoppedAt = new Date().toISOString();
+	}
+
+	const environment = this.getNodeParameter('environment', 0, 'prod') as string;
+	const projectName = cleanString(this.getNodeParameter('projectName', 0, ''));
+	const clientId = this.getNodeParameter('clientId', 0, 0) as number;
+	const overrides = this.getNodeParameter('conversationOverrides', 0, {}) as IDataObject;
+
+	const conversation: IDataObject = {};
+	for (const key of ['channel', 'userId', 'conversationId', 'input', 'output', 'language']) {
+		const value = cleanString(overrides[key]);
+		if (value) conversation[key] = value;
+	}
+
+	return {
+		...execution,
+		...finalised,
+		projectId,
+		...(projectName ? { projectName } : {}),
+		...(clientId > 0 ? { clientId } : {}),
+		environment,
+		...(Object.keys(conversation).length ? { conversation } : {}),
+		collector: {
+			source: 'n8n-nodes-insightshub',
+			node: this.getNode().name,
+			snapshotStatus: status ?? 'unknown',
+		},
+	};
+}
+
+function buildStructuredPayload(this: IExecuteFunctions, projectId: string): IDataObject {
+	const environment = this.getNodeParameter('environment', 0, 'prod') as string;
+	const projectName = this.getNodeParameter('projectName', 0, '') as string;
+	const clientId = this.getNodeParameter('clientId', 0, 0) as number;
+	const workflowStatus = this.getNodeParameter('workflowStatus', 0, 'success') as string;
+	const startedAtParam = this.getNodeParameter('startedAt', 0, '') as string;
+	const startedAt = startedAtParam || new Date().toISOString();
+	const durationMs = this.getNodeParameter('durationMs', 0, 0) as number;
+	const triggerType = this.getNodeParameter('triggerType', 0, '') as string;
+	const triggerPath = this.getNodeParameter('triggerPath', 0, '') as string;
+	const conversation = this.getNodeParameter('conversation', 0, {}) as Record<string, unknown>;
+	const aiUsage = safeParseJson(this.getNodeParameter('aiUsage', 0, '[]'), []) as unknown[];
+	const nodes = safeParseJson(this.getNodeParameter('nodes', 0, '[]'), []) as unknown[];
+	const errors = safeParseJson(this.getNodeParameter('errors', 0, '[]'), []) as unknown[];
+	const metadata = safeParseJson(this.getNodeParameter('metadata', 0, '{}'), {}) as object;
+
+	const workflow = this.getWorkflow();
+	const executionId = this.getExecutionId();
+
+	const trigger: Record<string, string> = {};
+	if (triggerType) trigger.type = triggerType;
+	if (triggerPath) trigger.path = triggerPath;
+
+	const finishedAt = durationMs
+		? new Date(new Date(startedAt).getTime() + durationMs).toISOString()
+		: undefined;
+
+	const hasConversation = Object.keys(conversation).length > 0;
+	const conversationPayload = hasConversation
+		? {
+				...(conversation.customerId ? { customerId: conversation.customerId } : {}),
+				...(conversation.channel ? { channel: conversation.channel } : {}),
+				...(conversation.input ? { input: conversation.input } : {}),
+				...(conversation.output ? { output: conversation.output } : {}),
+				...(conversation.language ? { language: conversation.language } : {}),
+				metadata: {},
+			}
+		: undefined;
+
+	return {
+		projectId,
+		...(projectName ? { projectName } : {}),
+		...(clientId > 0 ? { clientId } : {}),
+		environment,
+		workflow: {
+			id: workflow.id,
+			name: workflow.name,
+			executionId,
+			status: workflowStatus,
+			startedAt,
+			...(finishedAt ? { finishedAt } : {}),
+			...(durationMs > 0 ? { durationMs } : {}),
+			...(Object.keys(trigger).length ? { trigger } : {}),
+		},
+		...(conversationPayload ? { conversation: conversationPayload } : {}),
+		...(aiUsage.length ? { aiUsage } : {}),
+		...(nodes.length ? { nodes } : {}),
+		...(errors.length ? { errors } : {}),
+		metadata: { source: 'n8n', ...metadata },
+	};
+}

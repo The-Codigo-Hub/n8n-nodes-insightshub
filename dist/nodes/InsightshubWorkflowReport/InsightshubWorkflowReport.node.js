@@ -96,7 +96,7 @@ class InsightshubWorkflowReport {
                     displayOptions: { show: { payloadMode: ['native'] } },
                     placeholder: 'Add Override',
                     default: {},
-                    description: "Optional values that take precedence over the automatic conversation detection. Use expressions, e.g. {{ $('Webhook').first().JSON.body.userId }}.",
+                    description: 'Optional values that take precedence over the automatic conversation detection. Usually set with expressions that read the trigger node (see each field placeholder).',
                     options: [
                         {
                             displayName: 'Channel',
@@ -111,6 +111,7 @@ class InsightshubWorkflowReport {
                             name: 'conversationId',
                             type: 'string',
                             default: '',
+                            placeholder: "={{ $('Webhook').first().json.body.conversationId }}",
                             description: 'Identifier of the conversation or session',
                         },
                         {
@@ -142,7 +143,7 @@ class InsightshubWorkflowReport {
                             name: 'userId',
                             type: 'string',
                             default: '',
-                            placeholder: '5491100000000',
+                            placeholder: "={{ $('Webhook').first().json.body.userId }}",
                             description: 'Identifier of the end user (phone, WhatsApp ID, email, etc.)',
                         },
                     ],
@@ -339,7 +340,8 @@ class InsightshubWorkflowReport {
                             success: false,
                             projectId,
                             executionId: this.getExecutionId(),
-                            error: error.message,
+                            failedStep,
+                            error: `Failed to ${failedStep}: ${error.message}`,
                         },
                         pairedItem: { item: index },
                     })),

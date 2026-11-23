@@ -2,12 +2,6 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.InsightshubWorkflowReport = void 0;
 const n8n_workflow_1 = require("n8n-workflow");
-const DEFAULT_TIMEOUT_SECONDS = 15;
-function getTimeoutMs(context) {
-    const seconds = context.getNodeParameter('options.timeout', 0, DEFAULT_TIMEOUT_SECONDS);
-    const valid = Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_TIMEOUT_SECONDS;
-    return Math.round(valid * 1000);
-}
 function safeParseJson(value, fallback) {
     if (typeof value === 'string') {
         try {
@@ -30,7 +24,7 @@ class InsightshubWorkflowReport {
             icon: { light: 'file:insightshub.svg', dark: 'file:insightshub.dark.svg' },
             group: ['output'],
             version: 1,
-            description: 'Collects workflow execution telemetry and sends it to InsightHub for analysis. Place this node at the end of your workflow.',
+            description: 'Collects workflow execution telemetry and sends it to InsightHub for analysis. Place this node at the end of your workflow, or after an Error Trigger to report failed executions.',
             defaults: {
                 name: 'InsightsHub: Report Execution',
             },
@@ -94,6 +88,42 @@ class InsightshubWorkflowReport {
                     type: 'notice',
                     displayOptions: { show: { payloadMode: ['native'] } },
                     default: '',
+                },
+                {
+                    displayName: 'Execution to Report',
+                    name: 'executionSource',
+                    type: 'options',
+                    noDataExpression: true,
+                    displayOptions: { show: { payloadMode: ['native'] } },
+                    options: [
+                        {
+                            name: 'Failed Execution (Error Workflow)',
+                            value: 'errorTrigger',
+                            description: 'Report the execution that failed. Place the node after an Error Trigger, so executions that never reached the end of the workflow are reported too.',
+                        },
+                        {
+                            name: 'This Execution',
+                            value: 'current',
+                            description: 'Report the execution this node runs in. Place the node at the end of the workflow.',
+                        },
+                    ],
+                    default: 'current',
+                },
+                {
+                    displayName: 'In an Error Workflow, set Project ID and Project Name with expressions that read the workflow in the Error Trigger output (see the README), so the failed execution is stored under the same project as its workflow. InsightsHub ignores failed executions of workflows it does not know.',
+                    name: 'errorTriggerNotice',
+                    type: 'notice',
+                    displayOptions: { show: { payloadMode: ['native'], executionSource: ['errorTrigger'] } },
+                    default: '',
+                },
+                {
+                    displayName: 'Execution ID',
+                    name: 'executionId',
+                    type: 'string',
+                    displayOptions: { show: { payloadMode: ['native'], executionSource: ['errorTrigger'] } },
+                    default: '={{ $json.execution.id }}',
+                    required: true,
+                    description: 'ID of the failed execution. The default expression reads it from the Error Trigger output.',
                 },
                 {
                     displayName: 'Conversation Overrides',
@@ -312,6 +342,7 @@ class InsightshubWorkflowReport {
                     type: 'collection',
                     placeholder: 'Add Option',
                     default: {},
+                    description: 'How the node talks to InsightsHub and n8n. InsightsHub stores each execution once, so a retried send never duplicates data.',
                     options: [
                         {
                             displayName: 'Timeout (Seconds)',
@@ -319,7 +350,23 @@ class InsightshubWorkflowReport {
                             type: 'number',
                             typeOptions: { minValue: 1, maxValue: 120 },
                             default: DEFAULT_TIMEOUT_SECONDS,
-                            description: 'Maximum time to wait for each request (reading the execution from n8n and sending it to InsightsHub). Keeps a slow InsightsHub from holding the workflow open.',
+                            description: 'Maximum time to wait for each request (reading the execution from n8n and sending it to InsightsHub). Max Total Time caps the whole node, retries included.',
+                        },
+                        {
+                            displayName: 'Max Total Time (Seconds)',
+                            name: 'maxTotalSeconds',
+                            type: 'number',
+                            typeOptions: { minValue: 10, maxValue: 600 },
+                            default: DEFAULT_MAX_TOTAL_SECONDS,
+                            description: 'Time budget for the whole node, retries included. No new attempt starts once it is spent. Keep it below the workflow timeout.',
+                        },
+                        {
+                            displayName: 'Retries',
+                            name: 'retries',
+                            type: 'number',
+                            typeOptions: { minValue: 0, maxValue: 5 },
+                            default: DEFAULT_RETRIES,
+                            description: 'How many times to retry a request that fails with a timeout, a network error or a 408, 429 or 5xx response',
                         },
                     ],
                 },
@@ -327,7 +374,7 @@ class InsightshubWorkflowReport {
         };
     }
     async execute() {
-        var _a;
+        var _a, _b;
         const items = this.getInputData();
         const payloadMode = this.getNodeParameter('payloadMode', 0, 'structured');
         const credentials = await this.getCredentials('insightshubApi');
@@ -336,36 +383,51 @@ class InsightshubWorkflowReport {
         if (!projectId) {
             throw new n8n_workflow_1.NodeOperationError(this.getNode(), 'Project ID is required');
         }
-        const timeout = getTimeoutMs(this);
+        const delivery = getDeliveryOptions.call(this);
+        const executionSource = payloadMode === 'native'
+            ? this.getNodeParameter('executionSource', 0, 'current')
+            : 'current';
         let body = {};
         let apiResponse;
+        let reportedExecutionId = this.getExecutionId();
         let failedStep = payloadMode === 'native'
             ? 'fetch the execution from the n8n API'
             : 'build the InsightsHub payload';
+        let attempts = 0;
         try {
-            body =
-                payloadMode === 'native'
-                    ? await buildNativePayload.call(this, projectId, timeout)
-                    : buildStructuredPayload.call(this, projectId);
+            if (payloadMode === 'native') {
+                reportedExecutionId = resolveExecutionId.call(this, executionSource);
+                body = await buildNativePayload.call(this, projectId, {
+                    executionId: reportedExecutionId,
+                    executionSource,
+                    delivery,
+                });
+            }
+            else {
+                body = buildStructuredPayload.call(this, projectId);
+            }
             failedStep = 'send the execution to InsightsHub';
-            apiResponse = (await this.helpers.httpRequestWithAuthentication.call(this, 'insightshubApi', {
+            const sent = await requestWithRetry.call(this, 'insightshubApi', {
                 method: 'POST',
                 url: `${baseUrl}/api/n8n/executions/collect`,
                 headers: { 'Content-Type': 'application/json' },
                 body,
                 json: true,
-                timeout,
-            }));
+            }, delivery);
+            apiResponse = sent.response;
+            attempts = sent.attempts;
         }
         catch (error) {
             if (this.continueOnFail()) {
+                const failedAttempts = (_a = error.attempts) !== null && _a !== void 0 ? _a : attempts;
                 return [
                     items.map((_item, index) => ({
                         json: {
                             success: false,
                             projectId,
-                            executionId: this.getExecutionId(),
+                            executionId: reportedExecutionId,
                             failedStep,
+                            attempts: failedAttempts,
                             error: `Failed to ${failedStep}: ${error.message}`,
                         },
                         pairedItem: { item: index },
@@ -374,7 +436,7 @@ class InsightshubWorkflowReport {
             }
             if (error instanceof n8n_workflow_1.NodeOperationError) {
                 throw new n8n_workflow_1.NodeOperationError(this.getNode(), error, {
-                    description: (_a = error.description) !== null && _a !== void 0 ? _a : undefined,
+                    description: (_b = error.description) !== null && _b !== void 0 ? _b : undefined,
                 });
             }
             throw new n8n_workflow_1.NodeApiError(this.getNode(), error, {
@@ -384,6 +446,8 @@ class InsightshubWorkflowReport {
         const outputJson = {
             success: true,
             projectId,
+            executionId: reportedExecutionId,
+            attempts,
             ...apiResponse,
             ...(payloadMode === 'native' ? {} : { sentPayload: body }),
         };
@@ -392,31 +456,127 @@ class InsightshubWorkflowReport {
 }
 exports.InsightshubWorkflowReport = InsightshubWorkflowReport;
 const ACTIVE_STATUSES = new Set(['new', 'running', 'waiting', 'unknown']);
+const DEFAULT_TIMEOUT_SECONDS = 15;
+const DEFAULT_RETRIES = 2;
+const DEFAULT_MAX_TOTAL_SECONDS = 60;
+const MIN_ATTEMPT_MS = 1000;
+const RETRY_BASE_DELAY_MS = 1000;
+const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_ERROR_CODES = new Set([
+    'ECONNABORTED',
+    'ECONNREFUSED',
+    'ECONNRESET',
+    'EAI_AGAIN',
+    'ENOTFOUND',
+    'EPIPE',
+    'ETIMEDOUT',
+]);
 function cleanString(value) {
     if (value === undefined || value === null)
         return undefined;
     const text = String(value).trim();
     return text ? text : undefined;
 }
-async function buildNativePayload(projectId, timeout) {
+function getDeliveryOptions() {
+    var _a, _b, _c;
+    const options = this.getNodeParameter('options', 0, {});
+    const timeoutSeconds = Number((_a = options.timeout) !== null && _a !== void 0 ? _a : DEFAULT_TIMEOUT_SECONDS);
+    const retries = Number((_b = options.retries) !== null && _b !== void 0 ? _b : DEFAULT_RETRIES);
+    const maxTotalSeconds = Number((_c = options.maxTotalSeconds) !== null && _c !== void 0 ? _c : DEFAULT_MAX_TOTAL_SECONDS);
+    const totalSeconds = Math.min(Math.max(Number.isFinite(maxTotalSeconds) ? maxTotalSeconds : DEFAULT_MAX_TOTAL_SECONDS, 10), 600);
+    return {
+        deadline: Date.now() + totalSeconds * 1000,
+        timeoutMs: Math.round(Math.min(Math.max(Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : DEFAULT_TIMEOUT_SECONDS, 1), 120) * 1000),
+        retries: Math.min(Math.max(Number.isFinite(retries) ? Math.floor(retries) : DEFAULT_RETRIES, 0), 5),
+    };
+}
+function statusCodeOf(error) {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j;
+    const candidate = error;
+    const raw = (_g = (_f = (_e = (_d = (_b = (_a = candidate.response) === null || _a === void 0 ? void 0 : _a.status) !== null && _b !== void 0 ? _b : (_c = candidate.response) === null || _c === void 0 ? void 0 : _c.statusCode) !== null && _d !== void 0 ? _d : candidate.statusCode) !== null && _e !== void 0 ? _e : candidate.status) !== null && _f !== void 0 ? _f : candidate.httpCode) !== null && _g !== void 0 ? _g : (_j = (_h = candidate.cause) === null || _h === void 0 ? void 0 : _h.response) === null || _j === void 0 ? void 0 : _j.status;
+    const code = Number(raw);
+    return Number.isFinite(code) && code > 0 ? code : undefined;
+}
+function isRetryable(error, extraStatusCodes = []) {
+    var _a, _b, _c;
+    const statusCode = statusCodeOf(error);
+    if (statusCode !== undefined) {
+        return RETRYABLE_STATUS_CODES.has(statusCode) || extraStatusCodes.includes(statusCode);
+    }
+    const code = (_a = error.code) !== null && _a !== void 0 ? _a : (_b = error.cause) === null || _b === void 0 ? void 0 : _b.code;
+    if (code && RETRYABLE_ERROR_CODES.has(code))
+        return true;
+    return /timeout|timed out|socket hang up|network/i.test((_c = error === null || error === void 0 ? void 0 : error.message) !== null && _c !== void 0 ? _c : '');
+}
+async function requestWithRetry(credentialType, request, delivery, { extraRetryStatusCodes = [] } = {}) {
+    let lastError;
+    let attempts = 0;
+    for (let attempt = 0; attempt <= delivery.retries; attempt++) {
+        if (attempt > 0) {
+            const backoff = RETRY_BASE_DELAY_MS * 3 ** (attempt - 1);
+            if (delivery.deadline - Date.now() - backoff < MIN_ATTEMPT_MS)
+                break;
+            await (0, n8n_workflow_1.sleep)(backoff);
+        }
+        const remaining = delivery.deadline - Date.now();
+        if (remaining < MIN_ATTEMPT_MS) {
+            lastError !== null && lastError !== void 0 ? lastError : (lastError = new Error('The node ran out of time (Max Total Time) before sending'));
+            break;
+        }
+        attempts = attempt + 1;
+        try {
+            const response = (await this.helpers.httpRequestWithAuthentication.call(this, credentialType, {
+                ...request,
+                timeout: Math.min(delivery.timeoutMs, remaining),
+            }));
+            return { response, attempts };
+        }
+        catch (error) {
+            lastError = error;
+            if (!isRetryable(error, extraRetryStatusCodes))
+                break;
+        }
+    }
+    if (lastError && typeof lastError === 'object') {
+        lastError.attempts = attempts;
+    }
+    throw lastError;
+}
+function resolveExecutionId(executionSource) {
+    if (executionSource !== 'errorTrigger')
+        return this.getExecutionId();
+    const executionId = cleanString(this.getNodeParameter('executionId', 0, ''));
+    if (!executionId) {
+        throw new n8n_workflow_1.NodeOperationError(this.getNode(), 'No execution ID to report', {
+            description: 'In "Failed Execution (Error Workflow)" mode the node must run after an Error Trigger, which provides execution.id.',
+        });
+    }
+    if (executionId === this.getExecutionId()) {
+        throw new n8n_workflow_1.NodeOperationError(this.getNode(), 'The Execution ID points to this same execution', {
+            description: 'Use "This Execution" to report the current execution, or set Execution ID to {{ $json.execution.id }} after an Error Trigger.',
+        });
+    }
+    return executionId;
+}
+async function buildNativePayload(projectId, { executionId, executionSource, delivery, }) {
     const n8nCredentials = await this.getCredentials('insightshubN8nApi');
     const n8nBaseUrl = n8nCredentials.baseUrl
         .replace(/\/+$/, '')
         .replace(/\/api\/v1$/, '');
-    const executionId = this.getExecutionId();
-    const execution = (await this.helpers.httpRequestWithAuthentication.call(this, 'insightshubN8nApi', {
+    const { response: execution } = await requestWithRetry.call(this, 'insightshubN8nApi', {
         method: 'GET',
-        url: `${n8nBaseUrl}/api/v1/executions/${executionId}`,
+        url: `${n8nBaseUrl}/api/v1/executions/${encodeURIComponent(executionId)}`,
         qs: { includeData: true },
         json: true,
-        timeout,
-    }));
+    }, delivery, { extraRetryStatusCodes: executionSource === 'errorTrigger' ? [404] : [] });
     const data = execution.data;
     const resultData = data === null || data === void 0 ? void 0 : data.resultData;
     const runData = resultData === null || resultData === void 0 ? void 0 : resultData.runData;
     if (!runData || Object.keys(runData).length === 0) {
         throw new n8n_workflow_1.NodeOperationError(this.getNode(), `Execution ${executionId} has no node data yet`, {
-            description: 'Enable "Save execution progress" in the workflow settings so the n8n API returns the data of nodes that already ran.',
+            description: executionSource === 'errorTrigger'
+                ? 'n8n did not keep the data of the failed execution. Check "Save failed production executions" in the workflow settings.'
+                : 'Enable "Save execution progress" in the workflow settings so the n8n API returns the data of nodes that already ran.',
         });
     }
     const status = cleanString(execution.status);
@@ -447,6 +607,7 @@ async function buildNativePayload(projectId, timeout) {
         collector: {
             source: 'n8n-nodes-insightshub',
             node: this.getNode().name,
+            executionSource,
             snapshotStatus: status !== null && status !== void 0 ? status : 'unknown',
         },
     };

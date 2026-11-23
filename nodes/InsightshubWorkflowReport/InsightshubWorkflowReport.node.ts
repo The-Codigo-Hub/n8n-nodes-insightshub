@@ -14,6 +14,16 @@ import {
 // 1. We need execution-context APIs (getExecutionId, getWorkflow, getCredentials).
 // 2. We build a single bulk POST rather than per-item requests.
 
+// Without a timeout a slow InsightsHub keeps the workflow running until the gateway gives up
+// (about 90 s), holding an n8n execution slot even though the user already got the reply.
+const DEFAULT_TIMEOUT_SECONDS = 15;
+
+function getTimeoutMs(context: IExecuteFunctions): number {
+	const seconds = context.getNodeParameter('options.timeout', 0, DEFAULT_TIMEOUT_SECONDS) as number;
+	const valid = Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_TIMEOUT_SECONDS;
+	return Math.round(valid * 1000);
+}
+
 function safeParseJson(value: unknown, fallback: unknown): unknown {
 	if (typeof value === 'string') {
 		try {
@@ -332,6 +342,26 @@ export class InsightshubWorkflowReport implements INodeType {
 				description:
 					'Additional metadata object. Do not include secrets, API keys, passwords, or tokens.',
 			},
+
+			// ── Options (both modes) ─────────────────────────────────────────────────
+			{
+				displayName: 'Options',
+				name: 'options',
+				type: 'collection',
+				placeholder: 'Add Option',
+				default: {},
+				options: [
+					{
+						displayName: 'Timeout (Seconds)',
+						name: 'timeout',
+						type: 'number',
+						typeOptions: { minValue: 1, maxValue: 120 },
+						default: DEFAULT_TIMEOUT_SECONDS,
+						description:
+							'Maximum time to wait for each request (reading the execution from n8n and sending it to InsightsHub). Keeps a slow InsightsHub from holding the workflow open.',
+					},
+				],
+			},
 		],
 	};
 
@@ -346,6 +376,7 @@ export class InsightshubWorkflowReport implements INodeType {
 		if (!projectId) {
 			throw new NodeOperationError(this.getNode(), 'Project ID is required');
 		}
+		const timeout = getTimeoutMs(this);
 
 		let body: IDataObject = {};
 		let apiResponse: IDataObject;
@@ -357,7 +388,7 @@ export class InsightshubWorkflowReport implements INodeType {
 		try {
 			body =
 				payloadMode === 'native'
-					? await buildNativePayload.call(this, projectId)
+					? await buildNativePayload.call(this, projectId, timeout)
 					: buildStructuredPayload.call(this, projectId);
 
 			failedStep = 'send the execution to InsightsHub';
@@ -367,6 +398,7 @@ export class InsightshubWorkflowReport implements INodeType {
 				headers: { 'Content-Type': 'application/json' },
 				body,
 				json: true,
+				timeout,
 			})) as IDataObject;
 		} catch (error) {
 			if (this.continueOnFail()) {
@@ -423,6 +455,7 @@ function cleanString(value: unknown): string | undefined {
 async function buildNativePayload(
 	this: IExecuteFunctions,
 	projectId: string,
+	timeout: number,
 ): Promise<IDataObject> {
 	const n8nCredentials = await this.getCredentials('insightshubN8nApi');
 	const n8nBaseUrl = (n8nCredentials.baseUrl as string)
@@ -438,6 +471,7 @@ async function buildNativePayload(
 			url: `${n8nBaseUrl}/api/v1/executions/${executionId}`,
 			qs: { includeData: true },
 			json: true,
+			timeout,
 		},
 	)) as IDataObject;
 

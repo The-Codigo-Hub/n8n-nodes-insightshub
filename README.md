@@ -32,9 +32,10 @@ _State the minimum n8n version, as well as which versions you test against. You 
 
 ## Usage
 
-_This is an optional section. Use it to help users with any difficult or confusing aspects of the node._
+Place **InsightsHub: Report Execution** at the end of the workflow, after the reply has been sent to the user.
 
-_By the time users are looking for community nodes, they probably already know n8n basics. But if you expect new users, you can link to the [Try it out](https://docs.n8n.io/try-it-out/) documentation to help them get started._
+- **Timeout:** each request the node makes (reading the execution from the n8n API and sending it to InsightsHub) gives up after 15 seconds by default. Change it in **Options > Timeout (Seconds)**, from 1 to 120. Without a limit, a slow InsightsHub keeps the workflow running until the gateway gives up.
+- **Errors:** set the node's **On Error** setting to *Continue* so a failed or timed-out report never marks the workflow execution as failed. The node then outputs `success: false`, the step that failed and the error message.
 
 ## Resources
 

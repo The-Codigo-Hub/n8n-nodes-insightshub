@@ -2,6 +2,12 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.InsightshubWorkflowReport = void 0;
 const n8n_workflow_1 = require("n8n-workflow");
+const DEFAULT_TIMEOUT_SECONDS = 15;
+function getTimeoutMs(context) {
+    const seconds = context.getNodeParameter('options.timeout', 0, DEFAULT_TIMEOUT_SECONDS);
+    const valid = Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_TIMEOUT_SECONDS;
+    return Math.round(valid * 1000);
+}
 function safeParseJson(value, fallback) {
     if (typeof value === 'string') {
         try {
@@ -300,6 +306,23 @@ class InsightshubWorkflowReport {
                     default: '{}',
                     description: 'Additional metadata object. Do not include secrets, API keys, passwords, or tokens.',
                 },
+                {
+                    displayName: 'Options',
+                    name: 'options',
+                    type: 'collection',
+                    placeholder: 'Add Option',
+                    default: {},
+                    options: [
+                        {
+                            displayName: 'Timeout (Seconds)',
+                            name: 'timeout',
+                            type: 'number',
+                            typeOptions: { minValue: 1, maxValue: 120 },
+                            default: DEFAULT_TIMEOUT_SECONDS,
+                            description: 'Maximum time to wait for each request (reading the execution from n8n and sending it to InsightsHub). Keeps a slow InsightsHub from holding the workflow open.',
+                        },
+                    ],
+                },
             ],
         };
     }
@@ -313,6 +336,7 @@ class InsightshubWorkflowReport {
         if (!projectId) {
             throw new n8n_workflow_1.NodeOperationError(this.getNode(), 'Project ID is required');
         }
+        const timeout = getTimeoutMs(this);
         let body = {};
         let apiResponse;
         let failedStep = payloadMode === 'native'
@@ -321,7 +345,7 @@ class InsightshubWorkflowReport {
         try {
             body =
                 payloadMode === 'native'
-                    ? await buildNativePayload.call(this, projectId)
+                    ? await buildNativePayload.call(this, projectId, timeout)
                     : buildStructuredPayload.call(this, projectId);
             failedStep = 'send the execution to InsightsHub';
             apiResponse = (await this.helpers.httpRequestWithAuthentication.call(this, 'insightshubApi', {
@@ -330,6 +354,7 @@ class InsightshubWorkflowReport {
                 headers: { 'Content-Type': 'application/json' },
                 body,
                 json: true,
+                timeout,
             }));
         }
         catch (error) {
@@ -373,7 +398,7 @@ function cleanString(value) {
     const text = String(value).trim();
     return text ? text : undefined;
 }
-async function buildNativePayload(projectId) {
+async function buildNativePayload(projectId, timeout) {
     const n8nCredentials = await this.getCredentials('insightshubN8nApi');
     const n8nBaseUrl = n8nCredentials.baseUrl
         .replace(/\/+$/, '')
@@ -384,6 +409,7 @@ async function buildNativePayload(projectId) {
         url: `${n8nBaseUrl}/api/v1/executions/${executionId}`,
         qs: { includeData: true },
         json: true,
+        timeout,
     }));
     const data = execution.data;
     const resultData = data === null || data === void 0 ? void 0 : data.resultData;

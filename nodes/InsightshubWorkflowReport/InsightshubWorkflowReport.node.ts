@@ -2,27 +2,19 @@ import {
 	NodeConnectionTypes,
 	NodeApiError,
 	NodeOperationError,
+	sleep,
 	type IDataObject,
 	type IExecuteFunctions,
 	type INodeExecutionData,
 	type INodeType,
 	type INodeTypeDescription,
+	type IHttpRequestOptions,
 	type JsonObject,
 } from 'n8n-workflow';
 
 // Programmatic style is required because:
 // 1. We need execution-context APIs (getExecutionId, getWorkflow, getCredentials).
 // 2. We build a single bulk POST rather than per-item requests.
-
-// Without a timeout a slow InsightsHub keeps the workflow running until the gateway gives up
-// (about 90 s), holding an n8n execution slot even though the user already got the reply.
-const DEFAULT_TIMEOUT_SECONDS = 15;
-
-function getTimeoutMs(context: IExecuteFunctions): number {
-	const seconds = context.getNodeParameter('options.timeout', 0, DEFAULT_TIMEOUT_SECONDS) as number;
-	const valid = Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_TIMEOUT_SECONDS;
-	return Math.round(valid * 1000);
-}
 
 function safeParseJson(value: unknown, fallback: unknown): unknown {
 	if (typeof value === 'string') {
@@ -45,7 +37,7 @@ export class InsightshubWorkflowReport implements INodeType {
 		group: ['output'],
 		version: 1,
 		description:
-			'Collects workflow execution telemetry and sends it to InsightHub for analysis. Place this node at the end of your workflow.',
+			'Collects workflow execution telemetry and sends it to InsightHub for analysis. Place this node at the end of your workflow, or after an Error Trigger to report failed executions.',
 		defaults: {
 			name: 'InsightsHub: Report Execution',
 		},
@@ -116,6 +108,44 @@ export class InsightshubWorkflowReport implements INodeType {
 				type: 'notice',
 				displayOptions: { show: { payloadMode: ['native'] } },
 				default: '',
+			},
+			{
+				displayName: 'Execution to Report',
+				name: 'executionSource',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: { show: { payloadMode: ['native'] } },
+				options: [
+					{
+						name: 'Failed Execution (Error Workflow)',
+						value: 'errorTrigger',
+						description:
+							'Report the execution that failed. Place the node after an Error Trigger, so executions that never reached the end of the workflow are reported too.',
+					},
+					{
+						name: 'This Execution',
+						value: 'current',
+						description: 'Report the execution this node runs in. Place the node at the end of the workflow.',
+					},
+				],
+				default: 'current',
+			},
+			{
+				displayName:
+					'In an Error Workflow, set Project ID and Project Name with expressions that read the workflow in the Error Trigger output (see the README), so the failed execution is stored under the same project as its workflow. InsightsHub ignores failed executions of workflows it does not know.',
+				name: 'errorTriggerNotice',
+				type: 'notice',
+				displayOptions: { show: { payloadMode: ['native'], executionSource: ['errorTrigger'] } },
+				default: '',
+			},
+			{
+				displayName: 'Execution ID',
+				name: 'executionId',
+				type: 'string',
+				displayOptions: { show: { payloadMode: ['native'], executionSource: ['errorTrigger'] } },
+				default: '={{ $json.execution.id }}',
+				required: true,
+				description: 'ID of the failed execution. The default expression reads it from the Error Trigger output.',
 			},
 			{
 				displayName: 'Conversation Overrides',
@@ -344,12 +374,15 @@ export class InsightshubWorkflowReport implements INodeType {
 			},
 
 			// ── Options (both modes) ─────────────────────────────────────────────────
+			// `options.timeout` shipped in 0.3.2: keep its name and range so saved workflows keep their value.
 			{
 				displayName: 'Options',
 				name: 'options',
 				type: 'collection',
 				placeholder: 'Add Option',
 				default: {},
+				description:
+					'How the node talks to InsightsHub and n8n. InsightsHub stores each execution once, so a retried send never duplicates data.',
 				options: [
 					{
 						displayName: 'Timeout (Seconds)',
@@ -358,7 +391,25 @@ export class InsightshubWorkflowReport implements INodeType {
 						typeOptions: { minValue: 1, maxValue: 120 },
 						default: DEFAULT_TIMEOUT_SECONDS,
 						description:
-							'Maximum time to wait for each request (reading the execution from n8n and sending it to InsightsHub). Keeps a slow InsightsHub from holding the workflow open.',
+							'Maximum time to wait for each request (reading the execution from n8n and sending it to InsightsHub). Max Total Time caps the whole node, retries included.',
+					},
+					{
+						displayName: 'Max Total Time (Seconds)',
+						name: 'maxTotalSeconds',
+						type: 'number',
+						typeOptions: { minValue: 10, maxValue: 600 },
+						default: DEFAULT_MAX_TOTAL_SECONDS,
+						description:
+							'Time budget for the whole node, retries included. No new attempt starts once it is spent. Keep it below the workflow timeout.',
+					},
+					{
+						displayName: 'Retries',
+						name: 'retries',
+						type: 'number',
+						typeOptions: { minValue: 0, maxValue: 5 },
+						default: DEFAULT_RETRIES,
+						description:
+							'How many times to retry a request that fails with a timeout, a network error or a 408, 429 or 5xx response',
 					},
 				],
 			},
@@ -376,39 +427,55 @@ export class InsightshubWorkflowReport implements INodeType {
 		if (!projectId) {
 			throw new NodeOperationError(this.getNode(), 'Project ID is required');
 		}
-		const timeout = getTimeoutMs(this);
+
+		const delivery = getDeliveryOptions.call(this);
+		const executionSource =
+			payloadMode === 'native'
+				? (this.getNodeParameter('executionSource', 0, 'current') as ExecutionSource)
+				: 'current';
 
 		let body: IDataObject = {};
 		let apiResponse: IDataObject;
+		let reportedExecutionId: string = this.getExecutionId();
 		// Names the step that failed in error messages
 		let failedStep =
 			payloadMode === 'native'
 				? 'fetch the execution from the n8n API'
 				: 'build the InsightsHub payload';
+		let attempts = 0;
 		try {
-			body =
-				payloadMode === 'native'
-					? await buildNativePayload.call(this, projectId, timeout)
-					: buildStructuredPayload.call(this, projectId);
+			if (payloadMode === 'native') {
+				reportedExecutionId = resolveExecutionId.call(this, executionSource);
+				body = await buildNativePayload.call(this, projectId, {
+					executionId: reportedExecutionId,
+					executionSource,
+					delivery,
+				});
+			} else {
+				body = buildStructuredPayload.call(this, projectId);
+			}
 
 			failedStep = 'send the execution to InsightsHub';
-			apiResponse = (await this.helpers.httpRequestWithAuthentication.call(this, 'insightshubApi', {
+			const sent = await requestWithRetry.call(this, 'insightshubApi', {
 				method: 'POST',
 				url: `${baseUrl}/api/n8n/executions/collect`,
 				headers: { 'Content-Type': 'application/json' },
 				body,
 				json: true,
-				timeout,
-			})) as IDataObject;
+			}, delivery);
+			apiResponse = sent.response;
+			attempts = sent.attempts;
 		} catch (error) {
 			if (this.continueOnFail()) {
+				const failedAttempts = (error as RetryError).attempts ?? attempts;
 				return [
 					items.map((_item, index) => ({
 						json: {
 							success: false,
 							projectId,
-							executionId: this.getExecutionId(),
+							executionId: reportedExecutionId,
 							failedStep,
+							attempts: failedAttempts,
 							error: `Failed to ${failedStep}: ${(error as Error).message}`,
 						},
 						pairedItem: { item: index },
@@ -430,6 +497,8 @@ export class InsightshubWorkflowReport implements INodeType {
 		const outputJson: IDataObject = {
 			success: true,
 			projectId,
+			executionId: reportedExecutionId,
+			attempts,
 			...apiResponse,
 			...(payloadMode === 'native' ? {} : { sentPayload: body }),
 		};
@@ -439,6 +508,34 @@ export class InsightshubWorkflowReport implements INodeType {
 }
 
 const ACTIVE_STATUSES = new Set(['new', 'running', 'waiting', 'unknown']);
+// Without a timeout a slow InsightsHub keeps the workflow running until the gateway gives up
+// (about 90 s), holding an n8n execution slot even though the user already got the reply.
+const DEFAULT_TIMEOUT_SECONDS = 15;
+const DEFAULT_RETRIES = 2;
+const DEFAULT_MAX_TOTAL_SECONDS = 60;
+const MIN_ATTEMPT_MS = 1000;
+const RETRY_BASE_DELAY_MS = 1000;
+const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_ERROR_CODES = new Set([
+	'ECONNABORTED',
+	'ECONNREFUSED',
+	'ECONNRESET',
+	'EAI_AGAIN',
+	'ENOTFOUND',
+	'EPIPE',
+	'ETIMEDOUT',
+]);
+
+type ExecutionSource = 'current' | 'errorTrigger';
+
+interface DeliveryOptions {
+	timeoutMs: number;
+	retries: number;
+	/** Epoch ms after which no new attempt starts. */
+	deadline: number;
+}
+
+type RetryError = Error & { attempts?: number };
 
 function cleanString(value: unknown): string | undefined {
 	if (value === undefined || value === null) return undefined;
@@ -446,34 +543,155 @@ function cleanString(value: unknown): string | undefined {
 	return text ? text : undefined;
 }
 
+function getDeliveryOptions(this: IExecuteFunctions): DeliveryOptions {
+	const options = this.getNodeParameter('options', 0, {}) as IDataObject;
+	const timeoutSeconds = Number(options.timeout ?? DEFAULT_TIMEOUT_SECONDS);
+	const retries = Number(options.retries ?? DEFAULT_RETRIES);
+	const maxTotalSeconds = Number(options.maxTotalSeconds ?? DEFAULT_MAX_TOTAL_SECONDS);
+	const totalSeconds = Math.min(
+		Math.max(Number.isFinite(maxTotalSeconds) ? maxTotalSeconds : DEFAULT_MAX_TOTAL_SECONDS, 10),
+		600,
+	);
+	return {
+		deadline: Date.now() + totalSeconds * 1000,
+		timeoutMs: Math.round(
+			Math.min(Math.max(Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : DEFAULT_TIMEOUT_SECONDS, 1), 120) * 1000,
+		),
+		retries: Math.min(Math.max(Number.isFinite(retries) ? Math.floor(retries) : DEFAULT_RETRIES, 0), 5),
+	};
+}
+
+function statusCodeOf(error: unknown): number | undefined {
+	const candidate = error as {
+		httpCode?: string | number;
+		statusCode?: number;
+		status?: number;
+		response?: { status?: number; statusCode?: number };
+		cause?: { response?: { status?: number } };
+	};
+	const raw =
+		candidate.response?.status ??
+		candidate.response?.statusCode ??
+		candidate.statusCode ??
+		candidate.status ??
+		candidate.httpCode ??
+		candidate.cause?.response?.status;
+	const code = Number(raw);
+	return Number.isFinite(code) && code > 0 ? code : undefined;
+}
+
+function isRetryable(error: unknown, extraStatusCodes: number[] = []): boolean {
+	const statusCode = statusCodeOf(error);
+	if (statusCode !== undefined) {
+		return RETRYABLE_STATUS_CODES.has(statusCode) || extraStatusCodes.includes(statusCode);
+	}
+	const code = (error as { code?: string; cause?: { code?: string } }).code
+		?? (error as { cause?: { code?: string } }).cause?.code;
+	if (code && RETRYABLE_ERROR_CODES.has(code)) return true;
+	// No HTTP status and no known code: a timeout or a dropped connection.
+	return /timeout|timed out|socket hang up|network/i.test((error as Error)?.message ?? '');
+}
+
 /**
- * Fetches the current execution from the n8n API and returns it unmodified, apart from
+ * Sends one request, retrying transient failures (timeouts, network errors, 408/429/5xx)
+ * with exponential backoff: 1 s, 3 s, 9 s… InsightsHub upserts each execution by its id,
+ * so a retry after a request that did reach the backend does not duplicate anything.
+ * Attempts share the node's time budget (`delivery.deadline`): each one is cut to what is
+ * left, and none starts once the budget is spent.
+ */
+async function requestWithRetry(
+	this: IExecuteFunctions,
+	credentialType: string,
+	request: IHttpRequestOptions,
+	delivery: DeliveryOptions,
+	{ extraRetryStatusCodes = [] }: { extraRetryStatusCodes?: number[] } = {},
+): Promise<{ response: IDataObject; attempts: number }> {
+	let lastError: unknown;
+	let attempts = 0;
+	for (let attempt = 0; attempt <= delivery.retries; attempt++) {
+		if (attempt > 0) {
+			const backoff = RETRY_BASE_DELAY_MS * 3 ** (attempt - 1);
+			if (delivery.deadline - Date.now() - backoff < MIN_ATTEMPT_MS) break;
+			await sleep(backoff);
+		}
+		const remaining = delivery.deadline - Date.now();
+		if (remaining < MIN_ATTEMPT_MS) {
+			lastError ??= new Error('The node ran out of time (Max Total Time) before sending');
+			break;
+		}
+		attempts = attempt + 1;
+		try {
+			const response = (await this.helpers.httpRequestWithAuthentication.call(this, credentialType, {
+				...request,
+				timeout: Math.min(delivery.timeoutMs, remaining),
+			})) as IDataObject;
+			return { response, attempts };
+		} catch (error) {
+			lastError = error;
+			if (!isRetryable(error, extraRetryStatusCodes)) break;
+		}
+	}
+	if (lastError && typeof lastError === 'object') {
+		(lastError as RetryError).attempts = attempts;
+	}
+	throw lastError;
+}
+
+function resolveExecutionId(this: IExecuteFunctions, executionSource: ExecutionSource): string {
+	if (executionSource !== 'errorTrigger') return this.getExecutionId();
+
+	const executionId = cleanString(this.getNodeParameter('executionId', 0, ''));
+	if (!executionId) {
+		throw new NodeOperationError(this.getNode(), 'No execution ID to report', {
+			description:
+				'In "Failed Execution (Error Workflow)" mode the node must run after an Error Trigger, which provides execution.id.',
+		});
+	}
+	if (executionId === this.getExecutionId()) {
+		throw new NodeOperationError(this.getNode(), 'The Execution ID points to this same execution', {
+			description:
+				'Use "This Execution" to report the current execution, or set Execution ID to {{ $json.execution.id }} after an Error Trigger.',
+		});
+	}
+	return executionId;
+}
+
+/**
+ * Fetches an execution from the n8n API and returns it unmodified, apart from
  * finalising its status. The InsightsHub backend recognises native executions
  * (`data.resultData.runData` + `workflowData`) and extracts nodes, AI usage, tool calls,
  * errors and the conversation itself.
+ *
+ * "current": the execution this node runs in. It is still running, so its snapshot is
+ * closed here. "errorTrigger": a failed execution, already finished, sent as n8n stored it.
  */
 async function buildNativePayload(
 	this: IExecuteFunctions,
 	projectId: string,
-	timeout: number,
+	{
+		executionId,
+		executionSource,
+		delivery,
+	}: { executionId: string; executionSource: ExecutionSource; delivery: DeliveryOptions },
 ): Promise<IDataObject> {
 	const n8nCredentials = await this.getCredentials('insightshubN8nApi');
 	const n8nBaseUrl = (n8nCredentials.baseUrl as string)
 		.replace(/\/+$/, '')
 		.replace(/\/api\/v1$/, '');
-	const executionId = this.getExecutionId();
 
-	const execution = (await this.helpers.httpRequestWithAuthentication.call(
+	const { response: execution } = await requestWithRetry.call(
 		this,
 		'insightshubN8nApi',
 		{
 			method: 'GET',
-			url: `${n8nBaseUrl}/api/v1/executions/${executionId}`,
+			url: `${n8nBaseUrl}/api/v1/executions/${encodeURIComponent(executionId)}`,
 			qs: { includeData: true },
 			json: true,
-			timeout,
 		},
-	)) as IDataObject;
+		delivery,
+		// The Error Trigger can fire before n8n has stored the failed execution.
+		{ extraRetryStatusCodes: executionSource === 'errorTrigger' ? [404] : [] },
+	);
 
 	const data = execution.data as IDataObject | undefined;
 	const resultData = data?.resultData as IDataObject | undefined;
@@ -481,12 +699,14 @@ async function buildNativePayload(
 	if (!runData || Object.keys(runData).length === 0) {
 		throw new NodeOperationError(this.getNode(), `Execution ${executionId} has no node data yet`, {
 			description:
-				'Enable "Save execution progress" in the workflow settings so the n8n API returns the data of nodes that already ran.',
+				executionSource === 'errorTrigger'
+					? 'n8n did not keep the data of the failed execution. Check "Save failed production executions" in the workflow settings.'
+					: 'Enable "Save execution progress" in the workflow settings so the n8n API returns the data of nodes that already ran.',
 		});
 	}
 
-	// This node runs at the end of the workflow, so the snapshot is still "running".
-	// Close it here so InsightsHub stores the final state and duration.
+	// At the end of the workflow the snapshot is still "running": close it here so
+	// InsightsHub stores the final state and duration.
 	const status = cleanString(execution.status);
 	const finalised: IDataObject = {};
 	if (!status || ACTIVE_STATUSES.has(status)) {
@@ -517,6 +737,7 @@ async function buildNativePayload(
 		collector: {
 			source: 'n8n-nodes-insightshub',
 			node: this.getNode().name,
+			executionSource,
 			snapshotStatus: status ?? 'unknown',
 		},
 	};
